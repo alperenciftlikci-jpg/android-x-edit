@@ -11,6 +11,7 @@ package io.element.android.features.messages.impl.attachments.preview
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.material3.IconButton as Material3IconButton
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
@@ -22,6 +23,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -61,6 +63,7 @@ import io.element.android.libraries.designsystem.theme.components.Scaffold
 import io.element.android.libraries.designsystem.theme.components.Switch
 import io.element.android.libraries.designsystem.theme.components.Text
 import io.element.android.libraries.designsystem.theme.components.TopAppBar
+import io.element.android.libraries.imageeditor.ImageEditorScreen
 import io.element.android.libraries.designsystem.utils.CommonDrawables
 import io.element.android.libraries.mediaviewer.api.local.LocalMedia
 import io.element.android.libraries.mediaviewer.api.local.LocalMediaRenderer
@@ -93,6 +96,24 @@ fun AttachmentsPreviewView(
         state.eventSink(AttachmentsPreviewEvent.CancelAndClearSendState)
     }
 
+    var isEditingImage by remember { mutableStateOf(false) }
+
+    val media = state.attachment as? Attachment.Media
+    val mimeType = media?.localMedia?.info?.mimeType
+    val isImage = mimeType?.isMimeTypeImage() == true
+
+    if (isEditingImage && media != null) {
+        ImageEditorScreen(
+            sourceUri = media.localMedia.uri,
+            onCancel = { isEditingImage = false },
+            onConfirm = { editedUri ->
+                state.eventSink(AttachmentsPreviewEvent.ReplaceMediaUri(editedUri))
+                isEditingImage = false
+            },
+        )
+        return
+    }
+
     BackHandler(enabled = state.sendActionState !is SendActionState.Sending.Uploading && state.sendActionState !is SendActionState.Done) {
         postCancel()
     }
@@ -108,6 +129,16 @@ fun AttachmentsPreviewView(
                     )
                 },
                 title = {},
+                actions = {
+                    if (isImage) {
+                        Material3IconButton(onClick = { isEditingImage = true }) {
+                            Icon(
+                                imageVector = CompoundIcons.Edit(),
+                                contentDescription = stringResource(CommonStrings.action_edit),
+                            )
+                        }
+                    }
+                },
             )
         }
     ) { paddingValues ->

@@ -1,0 +1,223 @@
+/*
+ * Copyright (c) 2026 Element Creations Ltd.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial.
+ * Please see LICENSE files in the repository root for full details.
+ */
+package io.element.android.libraries.imageeditor.tools.crop
+
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathOperation
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.dp
+import kotlin.math.abs
+
+private enum class HandleEdge { TopLeft, TopRight, BottomLeft, BottomRight, None }
+
+/**
+ * Interactive crop overlay. Displays the current [rect] over the image area along
+ * with corner handles. Dragging a corner resizes the rectangle. When [aspectRatio]
+ * is non-null, the opposite corner is held fixed and the dragged corner is
+ * constrained to maintain the ratio.
+ *
+ * The rect is reported back via [onRectChange] in normalized image-space (0f..1f).
+ */
+@Composable
+fun CropOverlay(
+    rect: CropRect,
+    aspectRatio: Float?,
+    onRectChange: (CropRect) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val density = LocalDensity.current
+    val handleSizePx = with(density) { 22.dp.toPx() }
+    val handleHitSlop = with(density) { 32.dp.toPx() }
+    val borderWidthPx = with(density) { 2.dp.toPx() }
+
+    var canvasSize by remember { mutableStateOf(IntSize.Zero) }
+    var draggingHandle by remember { mutableStateOf(HandleEdge.None) }
+
+    Canvas(
+        modifier = modifier
+            .pointerInput(aspectRatio) {
+                detectDragGestures(
+                    onDragStart = { startOffset ->
+                        draggingHandle = pickHandle(rect, canvasSize, startOffset, handleHitSlop)
+                    },
+                    onDragEnd = { draggingHandle = HandleEdge.None },
+                    onDragCancel = { draggingHandle = HandleEdge.None },
+                    onDrag = { change, drag ->
+                        change.consume()
+                        if (draggingHandle == HandleEdge.None) return@detectDragGestures
+                        val w = canvasSize.width.coerceAtLeast(1).toFloat()
+                        val h = canvasSize.height.coerceAtLeast(1).toFloat()
+                        val deltaXNorm = drag.x / w
+                        val deltaYNorm = drag.y / h
+                        val updated = applyHandleDrag(
+                            rect = rect,
+                            handle = draggingHandle,
+                            dx = deltaXNorm,
+                            dy = deltaYNorm,
+                            aspectRatio = aspectRatio,
+                            canvasW = w,
+                            canvasH = h,
+                        )
+                        onRectChange(updated)
+                    },
+                )
+            },
+    ) {
+        canvasSize = IntSize(size.width.toInt(), size.height.toInt())
+
+        val cropLeftPx = rect.left * size.width
+        val cropTopPx = rect.top * size.height
+        val cropRightPx = rect.right * size.width
+        val cropBottomPx = rect.bottom * size.height
+
+        // Dim the area outside the crop rect.
+        val outer = Path().apply { addRect(Rect(0f, 0f, size.width, size.height)) }
+        val inner = Path().apply {
+            addRect(Rect(cropLeftPx, cropTopPx, cropRightPx, cropBottomPx))
+        }
+        val mask = Path().apply { op(outer, inner, PathOperation.Difference) }
+        drawPath(mask, color = Color.Black.copy(alpha = 0.55f))
+
+        // Crop rectangle border.
+        drawRect(
+            color = Color.White,
+            topLeft = Offset(cropLeftPx, cropTopPx),
+            size = Size(cropRightPx - cropLeftPx, cropBottomPx - cropTopPx),
+            style = Stroke(width = borderWidthPx),
+        )
+
+        // Rule-of-thirds gridlines.
+        val third1X = cropLeftPx + (cropRightPx - cropLeftPx) / 3f
+        val third2X = cropLeftPx + (cropRightPx - cropLeftPx) * 2f / 3f
+        val third1Y = cropTopPx + (cropBottomPx - cropTopPx) / 3f
+        val third2Y = cropTopPx + (cropBottomPx - cropTopPx) * 2f / 3f
+        val gridStroke = Stroke(width = borderWidthPx / 2f)
+        val gridColor = Color.White.copy(alpha = 0.5f)
+        drawLine(gridColor, Offset(third1X, cropTopPx), Offset(third1X, cropBottomPx), gridStroke.width)
+        drawLine(gridColor, Offset(third2X, cropTopPx), Offset(third2X, cropBottomPx), gridStroke.width)
+        drawLine(gridColor, Offset(cropLeftPx, third1Y), Offset(cropRightPx, third1Y), gridStroke.width)
+        drawLine(gridColor, Offset(cropLeftPx, third2Y), Offset(cropRightPx, third2Y), gridStroke.width)
+
+        // Corner handles.
+        val handles = listOf(
+            Offset(cropLeftPx, cropTopPx),
+            Offset(cropRightPx, cropTopPx),
+            Offset(cropLeftPx, cropBottomPx),
+            Offset(cropRightPx, cropBottomPx),
+        )
+        for (h in handles) {
+            drawRect(
+                color = Color.White,
+                topLeft = Offset(h.x - handleSizePx / 2f, h.y - handleSizePx / 2f),
+                size = Size(handleSizePx, handleSizePx),
+            )
+        }
+    }
+}
+
+private fun pickHandle(
+    rect: CropRect,
+    canvasSize: IntSize,
+    pos: Offset,
+    hitSlopPx: Float,
+): HandleEdge {
+    val w = canvasSize.width.toFloat().coerceAtLeast(1f)
+    val h = canvasSize.height.toFloat().coerceAtLeast(1f)
+    val tl = Offset(rect.left * w, rect.top * h)
+    val tr = Offset(rect.right * w, rect.top * h)
+    val bl = Offset(rect.left * w, rect.bottom * h)
+    val br = Offset(rect.right * w, rect.bottom * h)
+
+    fun within(target: Offset): Boolean =
+        abs(pos.x - target.x) < hitSlopPx && abs(pos.y - target.y) < hitSlopPx
+
+    return when {
+        within(tl) -> HandleEdge.TopLeft
+        within(tr) -> HandleEdge.TopRight
+        within(bl) -> HandleEdge.BottomLeft
+        within(br) -> HandleEdge.BottomRight
+        else -> HandleEdge.None
+    }
+}
+
+/** Minimum crop side, normalized — keeps the rect from collapsing to nothing. */
+private const val MIN_CROP_NORM = 0.08f
+
+private fun applyHandleDrag(
+    rect: CropRect,
+    handle: HandleEdge,
+    dx: Float,
+    dy: Float,
+    aspectRatio: Float?,
+    canvasW: Float,
+    canvasH: Float,
+): CropRect {
+    var left = rect.left
+    var top = rect.top
+    var right = rect.right
+    var bottom = rect.bottom
+
+    when (handle) {
+        HandleEdge.TopLeft -> {
+            left = (left + dx).coerceIn(0f, right - MIN_CROP_NORM)
+            top = (top + dy).coerceIn(0f, bottom - MIN_CROP_NORM)
+        }
+        HandleEdge.TopRight -> {
+            right = (right + dx).coerceIn(left + MIN_CROP_NORM, 1f)
+            top = (top + dy).coerceIn(0f, bottom - MIN_CROP_NORM)
+        }
+        HandleEdge.BottomLeft -> {
+            left = (left + dx).coerceIn(0f, right - MIN_CROP_NORM)
+            bottom = (bottom + dy).coerceIn(top + MIN_CROP_NORM, 1f)
+        }
+        HandleEdge.BottomRight -> {
+            right = (right + dx).coerceIn(left + MIN_CROP_NORM, 1f)
+            bottom = (bottom + dy).coerceIn(top + MIN_CROP_NORM, 1f)
+        }
+        HandleEdge.None -> Unit
+    }
+
+    if (aspectRatio == null || aspectRatio <= 0f) {
+        return CropRect(left, top, right, bottom)
+    }
+
+    // Aspect-locked: keep the corner opposite to the dragged one fixed and force
+    // the new height to satisfy width * canvasW / aspectRatio == height * canvasH.
+    val newWidth = right - left
+    val targetHeight = (newWidth * canvasW / aspectRatio) / canvasH
+    when (handle) {
+        HandleEdge.TopLeft -> {
+            top = (bottom - targetHeight).coerceAtLeast(0f).coerceAtMost(bottom - MIN_CROP_NORM)
+        }
+        HandleEdge.TopRight -> {
+            top = (bottom - targetHeight).coerceAtLeast(0f).coerceAtMost(bottom - MIN_CROP_NORM)
+        }
+        HandleEdge.BottomLeft -> {
+            bottom = (top + targetHeight).coerceAtMost(1f).coerceAtLeast(top + MIN_CROP_NORM)
+        }
+        HandleEdge.BottomRight -> {
+            bottom = (top + targetHeight).coerceAtMost(1f).coerceAtLeast(top + MIN_CROP_NORM)
+        }
+        HandleEdge.None -> Unit
+    }
+    return CropRect(left, top, right, bottom)
+}

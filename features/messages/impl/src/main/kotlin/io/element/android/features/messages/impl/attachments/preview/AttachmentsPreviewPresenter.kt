@@ -36,6 +36,7 @@ import io.element.android.libraries.di.annotations.SessionCoroutineScope
 import io.element.android.libraries.matrix.api.core.EventId
 import io.element.android.libraries.matrix.api.permalink.PermalinkBuilder
 import io.element.android.libraries.matrix.api.timeline.Timeline
+import io.element.android.libraries.mediaviewer.api.local.LocalMedia
 import io.element.android.libraries.mediaupload.api.MediaOptimizationConfig
 import io.element.android.libraries.mediaupload.api.MediaOptimizationConfigProvider
 import io.element.android.libraries.mediaupload.api.MediaSenderFactory
@@ -94,7 +95,10 @@ class AttachmentsPreviewPresenter(
 
         var preprocessMediaJob by remember { mutableStateOf<Job?>(null) }
 
-        val mediaAttachment = attachment as Attachment.Media
+        // Mutable copy of [attachment] so it can be replaced after editing the image.
+        // Initial value comes from the assisted constructor parameter.
+        var currentAttachment by remember { mutableStateOf(attachment) }
+        val mediaAttachment = currentAttachment as Attachment.Media
         val mediaOptimizationSelectorPresenter = remember {
             mediaOptimizationSelectorPresenterFactory.create(mediaAttachment.localMedia)
         }
@@ -104,13 +108,15 @@ class AttachmentsPreviewPresenter(
 
         var displayFileTooLargeError by remember { mutableStateOf(false) }
 
-        LaunchedEffect(mediaOptimizationSelectorState.displayMediaSelectorViews) {
+        LaunchedEffect(mediaOptimizationSelectorState.displayMediaSelectorViews, currentAttachment) {
             // If the media optimization selector is not displayed, we can pre-process the media
             // to prepare it for sending. This is done to avoid blocking the UI thread when the
-            // user clicks on the send button.
+            // user clicks on the send button. Also re-runs when [currentAttachment] is replaced
+            // by the image editor so the new bytes are pre-processed.
             if (mediaOptimizationSelectorState.displayMediaSelectorViews == false) {
+                preprocessMediaJob?.cancel()
                 preprocessMediaJob = preProcessAttachment(
-                    attachment = attachment,
+                    attachment = currentAttachment,
                     mediaOptimizationConfig = mediaOptimizationConfigProvider.get(),
                     displayProgress = false,
                     sendActionState = sendActionState,
@@ -152,7 +158,7 @@ class AttachmentsPreviewPresenter(
                                 videoCompressionPreset = mediaOptimizationSelectorState.selectedVideoPreset ?: VideoCompressionPreset.STANDARD,
                             )
                             preprocessMediaJob = preProcessAttachment(
-                                attachment = attachment,
+                                attachment = currentAttachment,
                                 mediaOptimizationConfig = config,
                                 displayProgress = true,
                                 sendActionState = sendActionState,
@@ -202,9 +208,16 @@ class AttachmentsPreviewPresenter(
 
                     // Dismiss the screen
                     dismiss(
-                        attachment,
+                        currentAttachment,
                         sendActionState,
                     )
+                }
+                is AttachmentsPreviewEvent.ReplaceMediaUri -> {
+                    val media = currentAttachment as? Attachment.Media ?: return
+                    val newLocalMedia = media.localMedia.copy(uri = event.uri)
+                    currentAttachment = media.copy(localMedia = newLocalMedia)
+                    // Reset processed state — the new image bytes will be re-pre-processed.
+                    sendActionState.value = SendActionState.Idle
                 }
                 AttachmentsPreviewEvent.CancelAndClearSendState -> {
                     // Cancel media sending
@@ -224,7 +237,7 @@ class AttachmentsPreviewPresenter(
         }
 
         return AttachmentsPreviewState(
-            attachment = attachment,
+            attachment = currentAttachment,
             sendActionState = sendActionState.value,
             textEditorState = textEditorState,
             mediaOptimizationSelectorState = mediaOptimizationSelectorState,

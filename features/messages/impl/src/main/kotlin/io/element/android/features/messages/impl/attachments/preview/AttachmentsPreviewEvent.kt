@@ -8,8 +8,13 @@
 
 package io.element.android.features.messages.impl.attachments.preview
 
+import android.net.Uri
+
 sealed interface AttachmentsPreviewEvent {
     data object SendAttachment : AttachmentsPreviewEvent
     data object CancelAndDismiss : AttachmentsPreviewEvent
     data object CancelAndClearSendState : AttachmentsPreviewEvent
+
+    /** Replaces the in-memory media URI after the user finished editing the image. */
+    data class ReplaceMediaUri(val uri: Uri) : AttachmentsPreviewEvent
 }
