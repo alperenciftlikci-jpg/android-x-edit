@@ -12,6 +12,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -27,7 +28,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import kotlin.math.abs
 
-private enum class HandleEdge { TopLeft, TopRight, BottomLeft, BottomRight, None }
+private enum class HandleEdge { TopLeft, TopRight, BottomLeft, BottomRight, Inside, None }
 
 /**
  * Interactive crop overlay. Displays the current [rect] over the image area along
@@ -52,12 +53,18 @@ fun CropOverlay(
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
     var draggingHandle by remember { mutableStateOf(HandleEdge.None) }
 
+    // Keep refs that always read the latest rect/callback from state. Without these
+    // the gesture coroutine captures the rect at first composition and every drag
+    // delta is applied to the same stale rect — producing the jittery feedback.
+    val currentRect by rememberUpdatedState(rect)
+    val onChange by rememberUpdatedState(onRectChange)
+
     Canvas(
         modifier = modifier
             .pointerInput(aspectRatio) {
                 detectDragGestures(
                     onDragStart = { startOffset ->
-                        draggingHandle = pickHandle(rect, canvasSize, startOffset, handleHitSlop)
+                        draggingHandle = pickHandle(currentRect, canvasSize, startOffset, handleHitSlop)
                     },
                     onDragEnd = { draggingHandle = HandleEdge.None },
                     onDragCancel = { draggingHandle = HandleEdge.None },
@@ -69,7 +76,7 @@ fun CropOverlay(
                         val deltaXNorm = drag.x / w
                         val deltaYNorm = drag.y / h
                         val updated = applyHandleDrag(
-                            rect = rect,
+                            rect = currentRect,
                             handle = draggingHandle,
                             dx = deltaXNorm,
                             dy = deltaYNorm,
@@ -77,7 +84,7 @@ fun CropOverlay(
                             canvasW = w,
                             canvasH = h,
                         )
-                        onRectChange(updated)
+                        onChange(updated)
                     },
                 )
             },
@@ -150,11 +157,14 @@ private fun pickHandle(
     fun within(target: Offset): Boolean =
         abs(pos.x - target.x) < hitSlopPx && abs(pos.y - target.y) < hitSlopPx
 
+    val insideRect = pos.x in tl.x..tr.x && pos.y in tl.y..bl.y
+
     return when {
         within(tl) -> HandleEdge.TopLeft
         within(tr) -> HandleEdge.TopRight
         within(bl) -> HandleEdge.BottomLeft
         within(br) -> HandleEdge.BottomRight
+        insideRect -> HandleEdge.Inside
         else -> HandleEdge.None
     }
 }
@@ -193,6 +203,14 @@ private fun applyHandleDrag(
             right = (right + dx).coerceIn(left + MIN_CROP_NORM, 1f)
             bottom = (bottom + dy).coerceIn(top + MIN_CROP_NORM, 1f)
         }
+        HandleEdge.Inside -> {
+            // Translate the whole rect, clamping so it stays inside (0,0)..(1,1).
+            val rectW = right - left
+            val rectH = bottom - top
+            val newLeft = (left + dx).coerceIn(0f, 1f - rectW)
+            val newTop = (top + dy).coerceIn(0f, 1f - rectH)
+            return CropRect(newLeft, newTop, newLeft + rectW, newTop + rectH)
+        }
         HandleEdge.None -> Unit
     }
 
@@ -217,7 +235,8 @@ private fun applyHandleDrag(
         HandleEdge.BottomRight -> {
             bottom = (top + targetHeight).coerceAtMost(1f).coerceAtLeast(top + MIN_CROP_NORM)
         }
-        HandleEdge.None -> Unit
+        // Inside is handled before this block via early return.
+        HandleEdge.Inside, HandleEdge.None -> Unit
     }
     return CropRect(left, top, right, bottom)
 }

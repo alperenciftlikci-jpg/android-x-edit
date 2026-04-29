@@ -15,7 +15,9 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.Typeface
 import android.net.Uri
+import androidx.compose.ui.text.style.TextAlign
 import io.element.android.libraries.imageeditor.ImageEditorConfig
+import io.element.android.libraries.imageeditor.tools.text.TextBackgroundMode
 import io.element.android.libraries.imageeditor.state.EditorState
 import io.element.android.libraries.imageeditor.tools.crop.CropRect
 import io.element.android.libraries.imageeditor.tools.draw.DrawingPath
@@ -152,6 +154,15 @@ object BitmapExporter {
             isAntiAlias = true
             typeface = Typeface.DEFAULT_BOLD
         }
+        val backgroundPaint = Paint().apply {
+            isAntiAlias = true
+            style = Paint.Style.FILL
+        }
+        // Match TextOverlay.kt — `padding(horizontal = 8dp, vertical = 4dp)`.
+        val padX = 8f * densityScale * strokeScale
+        val padY = 4f * densityScale * strokeScale
+        val cornerR = 6f * densityScale * strokeScale
+
         for (item in texts) {
             if (item.text.isBlank()) continue
             textPaint.color = item.color.toArgbColor()
@@ -159,13 +170,52 @@ object BitmapExporter {
             textPaint.textSize = sizePx
 
             // Wrap to fit within the bitmap width if needed.
-            val maxWidth = w - item.position.x * w - 16f
+            val blockLeft = item.position.x * w
+            val blockTop = item.position.y * h
+            val maxWidth = (w - blockLeft - 2f * padX).coerceAtLeast(1f)
             val lines = wrapText(item.text, textPaint, maxWidth)
+            if (lines.isEmpty()) continue
+
+            val lineWidths = lines.map { textPaint.measureText(it) }
+            val maxLineW = lineWidths.maxOrNull() ?: 0f
             val lineHeight = textPaint.fontMetrics.run { descent - ascent + leading }
-            // Position is the top-left in normalized coords; account for ascent.
-            var y = item.position.y * h - textPaint.fontMetrics.ascent
+            val blockW = maxLineW + 2f * padX
+            val blockH = lines.size * lineHeight + 2f * padY
+
+            // Background block.
+            val bgArgb = when (item.backgroundMode) {
+                TextBackgroundMode.None -> 0
+                TextBackgroundMode.Solid -> item.backgroundColor.toArgbColor()
+                TextBackgroundMode.SemiTransparent -> {
+                    val raw = item.backgroundColor.toArgbColor()
+                    // Replace alpha with ~50%.
+                    (0x80 shl 24) or (raw and 0x00ffffff)
+                }
+            }
+            if (item.backgroundMode != TextBackgroundMode.None) {
+                backgroundPaint.color = bgArgb
+                canvas.drawRoundRect(
+                    blockLeft,
+                    blockTop,
+                    blockLeft + blockW,
+                    blockTop + blockH,
+                    cornerR,
+                    cornerR,
+                    backgroundPaint,
+                )
+            }
+
+            // Pick Paint anchor + reference x to match the requested alignment.
+            val (anchor, refX) = when (item.align) {
+                TextAlign.Left, TextAlign.Start -> Paint.Align.LEFT to (blockLeft + padX)
+                TextAlign.Right, TextAlign.End -> Paint.Align.RIGHT to (blockLeft + blockW - padX)
+                else -> Paint.Align.CENTER to (blockLeft + blockW / 2f)
+            }
+            textPaint.textAlign = anchor
+
+            var y = blockTop + padY - textPaint.fontMetrics.ascent
             for (line in lines) {
-                canvas.drawText(line, item.position.x * w, y, textPaint)
+                canvas.drawText(line, refX, y, textPaint)
                 y += lineHeight
             }
         }

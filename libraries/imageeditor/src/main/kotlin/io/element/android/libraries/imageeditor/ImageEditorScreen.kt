@@ -47,7 +47,7 @@ import io.element.android.libraries.imageeditor.state.rememberEditorState
 import io.element.android.libraries.imageeditor.tools.crop.CropOverlay
 import io.element.android.libraries.imageeditor.tools.crop.CropRect
 import io.element.android.libraries.imageeditor.tools.draw.DrawCanvas
-import io.element.android.libraries.imageeditor.tools.text.TextEditDialog
+import io.element.android.libraries.imageeditor.tools.text.TextEditorScreen
 import io.element.android.libraries.imageeditor.tools.text.TextItem
 import io.element.android.libraries.imageeditor.tools.text.TextOverlay
 import io.element.android.libraries.imageeditor.ui.BottomToolbar
@@ -88,7 +88,48 @@ fun ImageEditorScreen(
     var editingTextItem by remember { mutableStateOf<TextItem?>(null) }
     var pendingNewText by remember { mutableStateOf(false) }
 
-    BackHandler(enabled = !isExporting) { onCancel() }
+    // While the text editor is open, render only it. Composing both Scaffolds at
+    // the same time confuses focus / IME, so the on-screen TextField could not
+    // accept keyboard input.
+    if (pendingNewText || editingTextItem != null) {
+        TextEditorScreen(
+            initial = editingTextItem,
+            palette = config.drawingPalette,
+            onSubmit = { item ->
+                if (editingTextItem == null) {
+                    state.addText(item)
+                } else {
+                    state.updateText(item)
+                }
+                pendingNewText = false
+                editingTextItem = null
+            },
+            onDelete = if (editingTextItem != null) {
+                { existing ->
+                    state.removeText(existing.id)
+                    pendingNewText = false
+                    editingTextItem = null
+                }
+            } else {
+                null
+            },
+            onDismiss = {
+                pendingNewText = false
+                editingTextItem = null
+            },
+        )
+        return
+    }
+
+    BackHandler(enabled = !isExporting) {
+        // First back press deselects the active tool (so an accidental edge-swipe
+        // while cropping doesn't dump all edits). Second back press closes editor.
+        if (state.activeTool != EditorTool.None) {
+            state.activeTool = EditorTool.None
+        } else {
+            onCancel()
+        }
+    }
 
     Scaffold(
         modifier = modifier
@@ -151,36 +192,6 @@ fun ImageEditorScreen(
             sourceUri = sourceUri,
             state = state,
             onTextItemTap = { editingTextItem = it; pendingNewText = false },
-        )
-    }
-
-    // Text edit / add dialog.
-    if (pendingNewText || editingTextItem != null) {
-        TextEditDialog(
-            initial = editingTextItem,
-            palette = config.drawingPalette,
-            onSubmit = { item ->
-                if (editingTextItem == null) {
-                    state.addText(item)
-                } else {
-                    state.updateText(item)
-                }
-                pendingNewText = false
-                editingTextItem = null
-            },
-            onDelete = if (editingTextItem != null) {
-                { existing ->
-                    state.removeText(existing.id)
-                    pendingNewText = false
-                    editingTextItem = null
-                }
-            } else {
-                null
-            },
-            onDismiss = {
-                pendingNewText = false
-                editingTextItem = null
-            },
         )
     }
 

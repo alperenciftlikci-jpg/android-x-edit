@@ -9,6 +9,19 @@ package io.element.android.libraries.imageeditor.tools.text
 import androidx.compose.runtime.Immutable
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextAlign
+
+/** How the background block is drawn behind a [TextItem]. */
+enum class TextBackgroundMode {
+    /** No background — only the glyphs are drawn. */
+    None,
+
+    /** Opaque rectangle in [TextItem.backgroundColor] behind the text. */
+    Solid,
+
+    /** Semi-transparent (~50%) rectangle in [TextItem.backgroundColor] behind the text. */
+    SemiTransparent,
+}
 
 /**
  * A single text annotation. [position] is normalized to (0f..1f) of the image
@@ -22,4 +35,7 @@ data class TextItem(
     val color: Color,
     val fontSizeSp: Float,
     val position: Offset,
+    val align: TextAlign = TextAlign.Center,
+    val backgroundMode: TextBackgroundMode = TextBackgroundMode.None,
+    val backgroundColor: Color = Color.Black,
 )

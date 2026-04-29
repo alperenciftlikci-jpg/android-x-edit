@@ -13,6 +13,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Modifier
@@ -47,6 +48,13 @@ fun DrawCanvas(
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
     val livePoints = remember { mutableStateListOf<Offset>() }
 
+    // Refs that always hold the latest values. Without these, the gesture coroutine
+    // (keyed on Unit) captures the color/stroke at first composition and saves the
+    // stale ones into the finished DrawingPath even after the user picked a new color.
+    val currentColor by rememberUpdatedState(color)
+    val currentStroke by rememberUpdatedState(strokeWidthDp)
+    val onFinished by rememberUpdatedState(onPathFinished)
+
     val gestureModifier = if (enabled) {
         Modifier.pointerInput(Unit) {
             detectDragGestures(
@@ -60,11 +68,11 @@ fun DrawCanvas(
                 },
                 onDragEnd = {
                     if (livePoints.size > 1) {
-                        onPathFinished(
+                        onFinished(
                             DrawingPath(
                                 points = livePoints.toList(),
-                                color = color,
-                                strokeWidthDp = strokeWidthDp,
+                                color = currentColor,
+                                strokeWidthDp = currentStroke,
                             )
                         )
                     }
