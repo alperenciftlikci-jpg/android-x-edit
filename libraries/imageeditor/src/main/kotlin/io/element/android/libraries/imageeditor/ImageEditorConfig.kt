@@ -67,8 +67,6 @@ data class ImageEditorConfig(
     enum class OutputFormat { JPEG, PNG }
 
     companion object {
-        val Default = ImageEditorConfig()
-
         val DefaultPalette: List<Color> = listOf(
             Color.White,
             Color.Black,
@@ -81,5 +79,10 @@ data class ImageEditorConfig(
         )
 
         val DefaultStrokeWidthsDp: List<Float> = listOf(3f, 6f, 12f, 20f)
+
+        // Must be declared AFTER the lists above — `Default` calls the constructor
+        // whose parameter defaults read those lists, and JVM initializes companion
+        // fields top-to-bottom.
+        val Default = ImageEditorConfig()
     }
 }
