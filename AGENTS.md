@@ -110,6 +110,12 @@ Always prefer Compound components and tokens from `libraries/compound/` module.
 
 ---
 
+## Performance Tracing
+
+Module performance is measured via `:libraries:core-perf` (`trace { } / traceAsync { }` wrapping `androidx.tracing`) and `:tests:macrobenchmark` (`TraceSectionMetric`). Use the section naming convention `<module>.<operation>[.<step>]` so alternative implementations of the same operation can be compared without changing the benchmark. Full guide: [docs/perf_tracing.md](docs/perf_tracing.md).
+
+---
+
 ## The Rust SDK Layer
 
 We wrap the `matrix-rust-sdk` to isolate the UI from the underlying SDK.

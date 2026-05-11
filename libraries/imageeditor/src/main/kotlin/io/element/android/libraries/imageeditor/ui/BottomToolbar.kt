@@ -29,6 +29,7 @@ import androidx.compose.material.icons.filled.Crop
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Flip
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.BorderColor
 import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
@@ -69,7 +70,7 @@ fun BottomToolbar(
         PrimaryToolRow(
             active = state.activeTool,
             onSelect = { tool ->
-                state.activeTool = if (state.activeTool == tool) EditorTool.None else tool
+                state.selectTool(if (state.activeTool == tool) EditorTool.None else tool)
             },
         )
     }
@@ -105,6 +106,12 @@ private fun PrimaryToolRow(
             isActive = active == EditorTool.Draw,
             onClick = { onSelect(EditorTool.Draw) },
             icon = { Icon(Icons.Filled.Edit, contentDescription = "Draw") },
+        )
+        ToolButton(
+            label = "Marker",
+            isActive = active == EditorTool.Highlighter,
+            onClick = { onSelect(EditorTool.Highlighter) },
+            icon = { Icon(Icons.Filled.BorderColor, contentDescription = "Highlighter") },
         )
         ToolButton(
             label = "Text",
@@ -161,6 +168,7 @@ private fun SecondaryRow(
             EditorTool.Crop -> CropControls(state)
             EditorTool.Rotate -> RotateControls(state)
             EditorTool.Draw -> DrawControls(state)
+            EditorTool.Highlighter -> HighlighterControls(state)
             EditorTool.Text -> TextControls(state, onAddText)
             EditorTool.None -> Spacer(Modifier.fillMaxWidth())
         }
@@ -236,6 +244,30 @@ private fun DrawControls(state: EditorState) {
 }
 
 @Composable
+private fun HighlighterControls(state: EditorState) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        IconButton(onClick = { state.undoLastPath() }) {
+            Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = "Undo")
+        }
+        ColorSwatchRow(
+            colors = state.config.drawingPalette,
+            selected = state.highlighterColor,
+            onSelect = state::setHighlighterColor,
+        )
+        Spacer(Modifier.width(8.dp))
+        StrokeWidthRow(
+            widths = state.config.highlighterStrokeWidthsDp,
+            selected = state.highlighterStrokeWidthDp,
+            onSelect = state::setHighlighterStrokeWidth,
+        )
+    }
+}
+
+@Composable
 private fun TextControls(state: EditorState, onAddText: () -> Unit) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -292,13 +324,20 @@ private fun StrokeWidthRow(
     selected: Float,
     onSelect: (Float) -> Unit,
 ) {
-    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         widths.forEach { w ->
             val isSelected = w == selected
-            val sizeDp = (w + 12).dp
+            // Render each preset as a horizontal pill. Width is fixed so the row
+            // stays the same size for both the Draw (3-20dp) and Highlighter
+            // (16-52dp) presets; height grows with the stroke value but is clamped
+            // so even the thickest preview fits inside the toolbar.
+            val barHeight = (w * 0.35f).coerceIn(3f, 14f).dp
             Spacer(
                 modifier = Modifier
-                    .size(sizeDp)
+                    .size(width = 30.dp, height = barHeight)
                     .clip(RoundedCornerShape(50))
                     .background(
                         if (isSelected) MaterialTheme.colorScheme.primary

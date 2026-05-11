@@ -64,6 +64,11 @@ import io.element.android.libraries.designsystem.theme.components.Switch
 import io.element.android.libraries.designsystem.theme.components.Text
 import io.element.android.libraries.designsystem.theme.components.TopAppBar
 import io.element.android.libraries.imageeditor.ImageEditorScreen
+import io.element.android.libraries.imageeditor.last.LastImageEditorScreen
+import io.element.android.libraries.imageeditor.modular.ModularImageEditorScreen
+import io.element.android.libraries.imageeditor.native_.ui.PhotoEditorProScreen
+import io.element.android.libraries.imageeditor.photoeditor.PhotoEditorImageEditorScreen
+import io.element.android.libraries.videoeditor.native_.ui.VideoEditorProScreen
 import io.element.android.libraries.designsystem.utils.CommonDrawables
 import io.element.android.libraries.mediaviewer.api.local.LocalMedia
 import io.element.android.libraries.mediaviewer.api.local.LocalMediaRenderer
@@ -97,18 +102,61 @@ fun AttachmentsPreviewView(
     }
 
     var isEditingImage by remember { mutableStateOf(false) }
+    var isEditingVideo by remember { mutableStateOf(false) }
+    // Dev-only A/B/C toggle. Pencil → baseline, "M" → modular (uCrop + Jetpack Ink), "P" →
+    // burhanrashid52/PhotoEditor. Each editor records perf traces under its own prefix
+    // (`imageeditor.*` / `imageeditor.modular.*` / `imageeditor.photoeditor.*`) so the dashboard
+    // at localhost:9999 clusters them alphabetically for direct comparison.
+    var editorVariant by remember { mutableStateOf(EditorVariant.Baseline) }
 
     val media = state.attachment as? Attachment.Media
     val mimeType = media?.localMedia?.info?.mimeType
     val isImage = mimeType?.isMimeTypeImage() == true
+    val isVideo = mimeType?.isMimeTypeVideo() == true
 
     if (isEditingImage && media != null) {
-        ImageEditorScreen(
+        val onCancelEdit = { isEditingImage = false }
+        val onConfirmEdit: (android.net.Uri) -> Unit = { editedUri ->
+            state.eventSink(AttachmentsPreviewEvent.ReplaceMediaUri(editedUri))
+            isEditingImage = false
+        }
+        when (editorVariant) {
+            EditorVariant.Baseline -> ImageEditorScreen(
+                sourceUri = media.localMedia.uri,
+                onCancel = onCancelEdit,
+                onConfirm = onConfirmEdit,
+            )
+            EditorVariant.Modular -> ModularImageEditorScreen(
+                sourceUri = media.localMedia.uri,
+                onCancel = onCancelEdit,
+                onConfirm = onConfirmEdit,
+            )
+            EditorVariant.PhotoEditor -> PhotoEditorImageEditorScreen(
+                sourceUri = media.localMedia.uri,
+                onCancel = onCancelEdit,
+                onConfirm = onConfirmEdit,
+            )
+            EditorVariant.Last -> LastImageEditorScreen(
+                sourceUri = media.localMedia.uri,
+                onCancel = onCancelEdit,
+                onConfirm = onConfirmEdit,
+            )
+            EditorVariant.NativeTelegramStyle -> PhotoEditorProScreen(
+                sourceUri = media.localMedia.uri,
+                onCancel = onCancelEdit,
+                onConfirm = onConfirmEdit,
+            )
+        }
+        return
+    }
+
+    if (isEditingVideo && media != null) {
+        VideoEditorProScreen(
             sourceUri = media.localMedia.uri,
-            onCancel = { isEditingImage = false },
+            onCancel = { isEditingVideo = false },
             onConfirm = { editedUri ->
                 state.eventSink(AttachmentsPreviewEvent.ReplaceMediaUri(editedUri))
-                isEditingImage = false
+                isEditingVideo = false
             },
         )
         return
@@ -131,11 +179,48 @@ fun AttachmentsPreviewView(
                 title = {},
                 actions = {
                     if (isImage) {
-                        Material3IconButton(onClick = { isEditingImage = true }) {
+                        // Baseline editor (Canvas + Path/Paint, our own implementation).
+                        Material3IconButton(onClick = {
+                            editorVariant = EditorVariant.Baseline
+                            isEditingImage = true
+                        }) {
                             Icon(
                                 imageVector = CompoundIcons.Edit(),
                                 contentDescription = stringResource(CommonStrings.action_edit),
                             )
+                        }
+                        // Modular editor (uCrop + Jetpack Ink). Dev-only A/B/C toggle.
+                        Material3IconButton(onClick = {
+                            editorVariant = EditorVariant.Modular
+                            isEditingImage = true
+                        }) {
+                            Text(text = "M")
+                        }
+                        // PhotoEditor (burhanrashid52/photoeditor — drawing/text/filters/emoji).
+                        Material3IconButton(onClick = {
+                            editorVariant = EditorVariant.PhotoEditor
+                            isEditingImage = true
+                        }) {
+                            Text(text = "P")
+                        }
+                        // Last — hybrid: uCrop crop + Jetpack Ink draw + native EditText text.
+                        Material3IconButton(onClick = {
+                            editorVariant = EditorVariant.Last
+                            isEditingImage = true
+                        }) {
+                            Text(text = "L")
+                        }
+                        // Native — Telegram-style C++/OpenGL backend with sliders + radial blur.
+                        Material3IconButton(onClick = {
+                            editorVariant = EditorVariant.NativeTelegramStyle
+                            isEditingImage = true
+                        }) {
+                            Text(text = "N")
+                        }
+                    } else if (isVideo) {
+                        // Trim — Telegram-style native video editor (FFmpeg + AMediaCodec).
+                        Material3IconButton(onClick = { isEditingVideo = true }) {
+                            Text(text = "✂")
                         }
                     }
                 },
@@ -473,3 +558,11 @@ fun VideoCompressionPreset.subtitle(): String {
         }
     )
 }
+
+/**
+ * Three image-editor implementations available for A/B/C performance comparison. The toolbar
+ * surfaces a button per variant; selecting one sets [editorVariant] and opens the matching screen.
+ * Trace section names use distinct prefixes (`imageeditor.*`, `imageeditor.modular.*`,
+ * `imageeditor.photoeditor.*`) so the perf dashboard clusters them alphabetically.
+ */
+private enum class EditorVariant { Baseline, Modular, PhotoEditor, Last, NativeTelegramStyle }

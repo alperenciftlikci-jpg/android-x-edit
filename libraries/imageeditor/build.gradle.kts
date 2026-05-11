@@ -13,6 +13,7 @@ android {
 }
 
 dependencies {
+    implementation(projects.libraries.corePerf)
     implementation(libs.androidx.compose.material.icons)
     implementation(libs.coil.compose)
     implementation(libs.timber)

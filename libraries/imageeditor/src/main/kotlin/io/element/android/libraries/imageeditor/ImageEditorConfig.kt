@@ -61,6 +61,10 @@ data class ImageEditorConfig(
     val aspectRatios: List<AspectRatioPreset> = AspectRatioPreset.Defaults,
     val drawingPalette: List<Color> = DefaultPalette,
     val strokeWidthsDp: List<Float> = DefaultStrokeWidthsDp,
+    /** Stroke width presets used by the Highlighter tool — wider than the pen. */
+    val highlighterStrokeWidthsDp: List<Float> = DefaultHighlighterStrokeWidthsDp,
+    /** Alpha applied to a highlighter stroke so it does not occlude the text underneath. */
+    val highlighterAlpha: Float = 0.5f,
     val outputQuality: Int = 92,
     val outputFormat: OutputFormat = OutputFormat.JPEG,
 ) {
@@ -79,6 +83,8 @@ data class ImageEditorConfig(
         )
 
         val DefaultStrokeWidthsDp: List<Float> = listOf(3f, 6f, 12f, 20f)
+
+        val DefaultHighlighterStrokeWidthsDp: List<Float> = listOf(16f, 24f, 36f, 52f)
 
         // Must be declared AFTER the lists above — `Default` calls the constructor
         // whose parameter defaults read those lists, and JVM initializes companion

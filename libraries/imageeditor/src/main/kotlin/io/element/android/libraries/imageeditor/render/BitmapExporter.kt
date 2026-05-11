@@ -8,14 +8,19 @@ package io.element.android.libraries.imageeditor.render
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.Typeface
 import android.net.Uri
+import android.text.Layout
+import android.text.StaticLayout
+import android.text.TextPaint
 import androidx.compose.ui.text.style.TextAlign
+import io.element.android.libraries.core.perf.BitmapDecoders
+import io.element.android.libraries.core.perf.trace
+import io.element.android.libraries.core.perf.traceAsync
 import io.element.android.libraries.imageeditor.ImageEditorConfig
 import io.element.android.libraries.imageeditor.tools.text.TextBackgroundMode
 import io.element.android.libraries.imageeditor.state.EditorState
@@ -34,8 +39,10 @@ import java.io.FileOutputStream
  * Pipeline:
  * 1. Load source bitmap from [sourceUri].
  * 2. Apply rotation + horizontal flip via Matrix.
- * 3. Crop to [EditorState.cropRect] in image-space coordinates.
- * 4. Rasterize drawing paths and text items on top.
+ * 3. Rasterize drawing paths and text items on top of the rotated bitmap. Path
+ *    coordinates are normalized against the on-screen canvas, which has the same
+ *    aspect as the rotated bitmap, so positions match what the user saw.
+ * 4. Crop to [EditorState.cropRect] (also in normalized rotated-image space).
  * 5. Encode (JPEG/PNG) and write to cache.
  *
  * Heavy work runs on [Dispatchers.IO]. The caller is responsible for deleting the
@@ -43,54 +50,97 @@ import java.io.FileOutputStream
  */
 object BitmapExporter {
 
+    // Reusable Paints + Typeface — kept at object level so we don't reallocate them across
+    // sequential exports. State (color, strokeWidth, textSize…) is set per draw call before use.
+    // Concurrent exports are not expected (the UI gates the Apply button while one is in flight),
+    // so we don't need ThreadLocal here. If that invariant ever changes, switch to per-call locals.
+    private val sharedStrokePaint = Paint().apply {
+        isAntiAlias = true
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val sharedTextPaint = TextPaint().apply {
+        isAntiAlias = true
+        typeface = Typeface.DEFAULT_BOLD
+    }
+    private val sharedBackgroundPaint = Paint().apply {
+        isAntiAlias = true
+        style = Paint.Style.FILL
+    }
+
     suspend fun export(
         context: Context,
         sourceUri: Uri,
         state: EditorState,
         densityScale: Float,
+        fontScale: Float = context.resources.configuration.fontScale,
     ): Result<Uri> = withContext(Dispatchers.IO) {
-        runCatching {
-            val source = loadBitmap(context, sourceUri)
-                ?: error("Could not decode image at $sourceUri")
-
-            // 1. Rotate + flip.
-            val transformed = applyRotateAndFlip(source, state.rotationDegrees, state.flippedHorizontally)
-            if (transformed !== source) source.recycle()
-
-            // 2. Crop.
-            val cropped = applyCrop(transformed, state.cropRect)
-            if (cropped !== transformed) transformed.recycle()
-
-            // 3. Annotate (draw + text). Mutable copy required.
-            val annotated = if (state.drawnPaths.isNotEmpty() || state.textItems.isNotEmpty()) {
-                val mutable = cropped.copy(Bitmap.Config.ARGB_8888, true)
-                if (mutable !== cropped) cropped.recycle()
-                drawAnnotations(mutable, state.drawnPaths, state.textItems, densityScale)
-                mutable
-            } else {
-                cropped
-            }
-
-            // 4. Encode.
-            val outFile = newCacheFile(context, state.config.outputFormat)
-            FileOutputStream(outFile).use { out ->
-                val format = when (state.config.outputFormat) {
-                    ImageEditorConfig.OutputFormat.JPEG -> Bitmap.CompressFormat.JPEG
-                    ImageEditorConfig.OutputFormat.PNG -> Bitmap.CompressFormat.PNG
+        traceAsync("imageeditor.export") {
+            runCatching {
+                val source = trace("imageeditor.export.decode") {
+                    loadBitmap(context, sourceUri)
+                        ?: error("Could not decode image at $sourceUri")
                 }
-                annotated.compress(format, state.config.outputQuality, out)
-                out.flush()
+
+                // 1. Rotate + flip — bitmap now matches what the user is looking at.
+                val transformed = trace("imageeditor.export.transform") {
+                    applyRotateAndFlip(source, state.rotationDegrees, state.flippedHorizontally)
+                }
+                if (transformed !== source) source.recycle()
+
+                // 2. Annotate (draw + text) on the rotated bitmap. Path/text coords are
+                //    normalized to the on-screen canvas, which we sized to the rotated
+                //    image's aspect ratio — so they translate 1:1 here. We pass the
+                //    canvas pixel size so stroke widths in dp scale correctly.
+                val canvasW = state.canvasSizePx.width.takeIf { it > 0 } ?: transformed.width
+                val annotated = if (state.drawnPaths.isNotEmpty() || state.textItems.isNotEmpty()) {
+                    val mutable = transformed.copy(Bitmap.Config.ARGB_8888, true)
+                    if (mutable !== transformed) transformed.recycle()
+                    val canvas = Canvas(mutable)
+                    if (state.drawnPaths.isNotEmpty()) {
+                        trace("imageeditor.export.draw.paths") {
+                            drawPaths(canvas, state.drawnPaths, mutable.width.toFloat(), mutable.height.toFloat(), canvasW, densityScale)
+                        }
+                    }
+                    if (state.textItems.isNotEmpty()) {
+                        trace("imageeditor.export.draw.text") {
+                            drawTexts(canvas, state.textItems, mutable.width.toFloat(), mutable.height.toFloat(), canvasW, densityScale, fontScale)
+                        }
+                    }
+                    mutable
+                } else {
+                    transformed
+                }
+
+                // 3. Crop applied last — overlays drawn outside the crop rect get clipped
+                //    away, which matches the user's expectation when they crop after
+                //    annotating.
+                val cropped = trace("imageeditor.export.crop") {
+                    applyCrop(annotated, state.cropRect)
+                }
+                if (cropped !== annotated) annotated.recycle()
+
+                // 4. Encode.
+                trace("imageeditor.export.encode") {
+                    val outFile = newCacheFile(context, state.config.outputFormat)
+                    FileOutputStream(outFile).use { out ->
+                        val format = when (state.config.outputFormat) {
+                            ImageEditorConfig.OutputFormat.JPEG -> Bitmap.CompressFormat.JPEG
+                            ImageEditorConfig.OutputFormat.PNG -> Bitmap.CompressFormat.PNG
+                        }
+                        cropped.compress(format, state.config.outputQuality, out)
+                        out.flush()
+                    }
+                    cropped.recycle()
+                    Uri.fromFile(outFile)
+                }
             }
-            annotated.recycle()
-            Uri.fromFile(outFile)
         }
     }
 
-    private fun loadBitmap(context: Context, uri: Uri): Bitmap? {
-        return context.contentResolver.openInputStream(uri)?.use { input ->
-            BitmapFactory.decodeStream(input)
-        }
-    }
+    private fun loadBitmap(context: Context, uri: Uri): Bitmap? =
+        BitmapDecoders.decodeFullRes(context, uri)
 
     private fun applyRotateAndFlip(source: Bitmap, rotationDegrees: Int, flipH: Boolean): Bitmap {
         if (rotationDegrees == 0 && !flipH) return source
@@ -110,28 +160,25 @@ object BitmapExporter {
         return Bitmap.createBitmap(source, left, top, right - left, bottom - top)
     }
 
-    private fun drawAnnotations(
-        bitmap: Bitmap,
+    private fun drawPaths(
+        canvas: Canvas,
         paths: List<DrawingPath>,
-        texts: List<TextItem>,
+        w: Float,
+        h: Float,
+        canvasPxWidth: Int,
         densityScale: Float,
     ) {
-        val canvas = Canvas(bitmap)
-        val w = bitmap.width.toFloat()
-        val h = bitmap.height.toFloat()
-
-        // Drawings — line strokes encoded in normalized coordinates.
-        // Choose a bitmap-relative stroke factor so a 6dp pen on a phone screen stays
-        // proportionally similar after export to a high-resolution bitmap.
-        val strokeScale = (w / 1080f).coerceAtLeast(1f)
-
-        val strokePaint = Paint().apply {
-            isAntiAlias = true
-            style = Paint.Style.STROKE
-            strokeCap = Paint.Cap.ROUND
-            strokeJoin = Paint.Join.ROUND
+        // The user's canvas was [canvasPxWidth] pixels wide and contained an image
+        // with the same aspect as this bitmap. To make a 6dp pen on screen render
+        // at the same visual thickness in the exported bitmap, scale by the ratio
+        // bitmap_w / canvas_w. No floor — for small images the scale must shrink,
+        // otherwise the canvas-space size leaks into the bitmap and overflows it.
+        val strokeScale = if (canvasPxWidth > 0) {
+            w / canvasPxWidth.toFloat()
+        } else {
+            w / 1080f
         }
-
+        val strokePaint = sharedStrokePaint
         for (path in paths) {
             if (path.points.size < 2) continue
             strokePaint.color = path.color.toArgbColor()
@@ -146,18 +193,23 @@ object BitmapExporter {
             }
             canvas.drawPath(nativePath, strokePaint)
         }
+    }
 
+    private fun drawTexts(
+        canvas: Canvas,
+        texts: List<TextItem>,
+        w: Float,
+        h: Float,
+        canvasPxWidth: Int,
+        densityScale: Float,
+        fontScale: Float,
+    ) {
         // Text — sp size on the editor canvas needs to translate to bitmap pixels.
         // We treat the editor canvas as having displayed the bitmap at fit-width on a
         // ~1080px-wide phone, so multiply font size by (bitmap_width / 1080) for parity.
-        val textPaint = Paint().apply {
-            isAntiAlias = true
-            typeface = Typeface.DEFAULT_BOLD
-        }
-        val backgroundPaint = Paint().apply {
-            isAntiAlias = true
-            style = Paint.Style.FILL
-        }
+        val strokeScale = if (canvasPxWidth > 0) w / canvasPxWidth.toFloat() else w / 1080f
+        val textPaint = sharedTextPaint
+        val backgroundPaint = sharedBackgroundPaint
         // Match TextOverlay.kt — `padding(horizontal = 8dp, vertical = 4dp)`.
         val padX = 8f * densityScale * strokeScale
         val padY = 4f * densityScale * strokeScale
@@ -166,21 +218,56 @@ object BitmapExporter {
         for (item in texts) {
             if (item.text.isBlank()) continue
             textPaint.color = item.color.toArgbColor()
-            val sizePx = item.fontSizeSp * densityScale * strokeScale
+            // Match Compose's BasicText fontSize.sp render: density × fontScale × sp size.
+            // Without fontScale, an editor whose system font scale is 1.2× would draw text 20%
+            // bigger on canvas than in the exported bitmap, making positions look mis-aligned.
+            val sizePx = item.fontSizeSp * densityScale * fontScale * strokeScale
             textPaint.textSize = sizePx
+            // Paint.textAlign is irrelevant for StaticLayout — alignment is set on the layout.
 
-            // Wrap to fit within the bitmap width if needed.
+            // Two-pass StaticLayout to match Compose `BasicText` alignment behavior.
+            //
+            // Why two passes: StaticLayout's `width` parameter doubles as the alignment frame —
+            // ALIGN_CENTER centres text inside *that* width, not inside the text's own bounds.
+            // Passing the remaining bitmap width (e.g. `bitmap_w - blockLeft - 2*padX`) means the
+            // text gets centred over the right half of the bitmap, dragging the visible glyphs
+            // ~0.3*w to the right of where the user placed the text on canvas. Compose BasicText
+            // does the right thing: the widget shrinks to the max line width and *then* applies
+            // alignment within that. We replicate that here:
+            //   Pass 1: build with the wrap-bound width to discover the natural line widths.
+            //   Pass 2: rebuild with `maxLineWidth` as the layout width, applying alignment
+            //           within the text's own bounds. Per-line ALIGN_CENTER offsets are now
+            //           identical to Compose's.
             val blockLeft = item.position.x * w
             val blockTop = item.position.y * h
-            val maxWidth = (w - blockLeft - 2f * padX).coerceAtLeast(1f)
-            val lines = wrapText(item.text, textPaint, maxWidth)
-            if (lines.isEmpty()) continue
-
-            val lineWidths = lines.map { textPaint.measureText(it) }
-            val maxLineW = lineWidths.maxOrNull() ?: 0f
-            val lineHeight = textPaint.fontMetrics.run { descent - ascent + leading }
-            val blockW = maxLineW + 2f * padX
-            val blockH = lines.size * lineHeight + 2f * padY
+            val wrapBoundWidth = (w - blockLeft - 2f * padX).coerceAtLeast(1f).toInt()
+            val alignment = when (item.align) {
+                TextAlign.Left, TextAlign.Start -> Layout.Alignment.ALIGN_NORMAL
+                TextAlign.Right, TextAlign.End -> Layout.Alignment.ALIGN_OPPOSITE
+                else -> Layout.Alignment.ALIGN_CENTER
+            }
+            // Pass 1 — discover the actual line widths under the wrap constraint.
+            val measureLayout = StaticLayout.Builder
+                .obtain(item.text, 0, item.text.length, textPaint, wrapBoundWidth)
+                .setAlignment(Layout.Alignment.ALIGN_NORMAL)
+                .setIncludePad(false)
+                .build()
+            if (measureLayout.lineCount == 0) continue
+            var maxLineWidth = 0f
+            for (i in 0 until measureLayout.lineCount) {
+                val lw = measureLayout.getLineWidth(i)
+                if (lw > maxLineWidth) maxLineWidth = lw
+            }
+            // Pass 2 — final layout sized to the actual content; alignment now applies inside
+            // the text's own bounds, matching Compose.
+            val finalLayoutWidth = maxLineWidth.toInt().coerceAtLeast(1)
+            val layout = StaticLayout.Builder
+                .obtain(item.text, 0, item.text.length, textPaint, finalLayoutWidth)
+                .setAlignment(alignment)
+                .setIncludePad(false)
+                .build()
+            val blockW = maxLineWidth + 2f * padX
+            val blockH = layout.height.toFloat() + 2f * padY
 
             // Background block.
             val bgArgb = when (item.backgroundMode) {
@@ -205,44 +292,14 @@ object BitmapExporter {
                 )
             }
 
-            // Pick Paint anchor + reference x to match the requested alignment.
-            val (anchor, refX) = when (item.align) {
-                TextAlign.Left, TextAlign.Start -> Paint.Align.LEFT to (blockLeft + padX)
-                TextAlign.Right, TextAlign.End -> Paint.Align.RIGHT to (blockLeft + blockW - padX)
-                else -> Paint.Align.CENTER to (blockLeft + blockW / 2f)
-            }
-            textPaint.textAlign = anchor
-
-            var y = blockTop + padY - textPaint.fontMetrics.ascent
-            for (line in lines) {
-                canvas.drawText(line, refX, y, textPaint)
-                y += lineHeight
-            }
+            // StaticLayout draws its lines with their own internal x positions according to
+            // `alignment`. We translate the canvas to the (left,top) inside the padded box and
+            // then call `layout.draw`. `save/restore` keeps subsequent text items unaffected.
+            val saveCount = canvas.save()
+            canvas.translate(blockLeft + padX, blockTop + padY)
+            layout.draw(canvas)
+            canvas.restoreToCount(saveCount)
         }
-    }
-
-    private fun wrapText(text: String, paint: Paint, maxWidth: Float): List<String> {
-        if (maxWidth <= 0f) return text.lines()
-        val result = mutableListOf<String>()
-        for (rawLine in text.lines()) {
-            if (paint.measureText(rawLine) <= maxWidth) {
-                result += rawLine
-                continue
-            }
-            val words = rawLine.split(' ')
-            val current = StringBuilder()
-            for (word in words) {
-                val candidate = if (current.isEmpty()) word else "$current $word"
-                if (paint.measureText(candidate) <= maxWidth) {
-                    current.clear().append(candidate)
-                } else {
-                    if (current.isNotEmpty()) result += current.toString()
-                    current.clear().append(word)
-                }
-            }
-            if (current.isNotEmpty()) result += current.toString()
-        }
-        return result
     }
 
     private fun newCacheFile(context: Context, format: ImageEditorConfig.OutputFormat): File {

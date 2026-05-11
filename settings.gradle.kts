@@ -21,6 +21,8 @@ dependencyResolutionManagement {
             url = uri("https://www.jitpack.io")
             content {
                 includeModule("com.github.matrix-org", "matrix-analytics-events")
+                // uCrop — needed by :libraries:imageeditor-modular
+                includeModule("com.github.yalantis", "ucrop")
             }
         }
         google()
@@ -46,6 +48,7 @@ include(":tests:detekt-rules")
 include(":tests:konsist")
 include(":tests:uitests")
 include(":tests:testutils")
+include(":tests:macrobenchmark")
 include(":annotations")
 include(":codegen")
 

@@ -14,8 +14,15 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.startup.AppInitializer
 import androidx.work.Configuration
 import dev.zacsweers.metro.createGraphFactory
+import io.element.android.libraries.core.perf.FpsSampler
+import io.element.android.libraries.core.perf.JankCollector
+import io.element.android.libraries.core.perf.MatrixBridge
+import io.element.android.libraries.core.perf.MemoryCollector
+import io.element.android.libraries.core.perf.PerfHttpServer
+import io.element.android.libraries.core.perf.PerfRegistry
 import io.element.android.libraries.di.DependencyInjectionGraphOwner
 import io.element.android.libraries.workmanager.api.di.MetroWorkerFactory
+import io.element.android.x.BuildConfig
 import io.element.android.x.di.AppGraph
 import io.element.android.x.info.logApplicationInfo
 import io.element.android.x.initializer.CacheCleanerInitializer
@@ -36,6 +43,22 @@ class ElementXApplication : Application(), DependencyInjectionGraphOwner, Config
             initializeComponent(CrashInitializer::class.java)
             initializeComponent(PlatformInitializer::class.java)
             initializeComponent(CacheCleanerInitializer::class.java)
+        }
+
+        // Debug-only perf HUD: collects JankStats + Tencent Matrix issues, and serves a localhost
+        // HTML report at :9999. See docs/perf_tracing.md for `adb forward` workflow.
+        if (BuildConfig.DEBUG) {
+            JankCollector.start(this)
+            MatrixBridge.start(this)
+            MemoryCollector.start()
+            FpsSampler.start()
+            // Declare per-library FPS SLAs — these surface as PASS/FAIL panels at the top of the
+            // perf dashboard's FPS section. Edit the numbers below to match the budget you've
+            // committed to. Longest-matching prefix wins when prefixes overlap.
+            PerfRegistry.declareSla(prefix = "imageeditor", minFps = 60f, targetFps = 75f, label = "Baseline editor")
+            PerfRegistry.declareSla(prefix = "imageeditor.modular", minFps = 60f, targetFps = 75f, label = "Modular (uCrop + Jetpack Ink)")
+            PerfRegistry.declareSla(prefix = "imageeditor.photoeditor", minFps = 60f, targetFps = 75f, label = "PhotoEditor (burhanrashid52)")
+            PerfHttpServer.start(this)
         }
 
         logApplicationInfo(this)

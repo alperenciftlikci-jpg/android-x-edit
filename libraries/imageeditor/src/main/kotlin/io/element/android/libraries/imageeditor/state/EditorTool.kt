@@ -11,5 +11,6 @@ enum class EditorTool {
     Crop,
     Rotate,
     Draw,
+    Highlighter,
     Text,
 }

@@ -123,6 +123,9 @@ android {
                 oidcRedirectSchemeBase,
             )
             signingConfig = signingConfigs.getByName("debug")
+            // Required so :tests:macrobenchmark can attach Perfetto / capture custom Trace sections
+            // against a production-like build. See docs/perf_tracing.md.
+            isProfileable = true
 
             optimization {
                 enable = true

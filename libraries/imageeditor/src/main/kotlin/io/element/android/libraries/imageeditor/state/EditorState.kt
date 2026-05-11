@@ -15,6 +15,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.IntSize
+import io.element.android.libraries.core.perf.trace
 import io.element.android.libraries.imageeditor.AspectRatioPreset
 import io.element.android.libraries.imageeditor.ImageEditorConfig
 import io.element.android.libraries.imageeditor.tools.crop.CropRect
@@ -32,6 +34,19 @@ class EditorState internal constructor(
     var activeTool: EditorTool by mutableStateOf(EditorTool.None)
         internal set
 
+    /**
+     * Pixel size of the area where the image and overlays are rendered. Captured
+     * from the on-screen Box via `onSizeChanged`. Used by [io.element.android.libraries.imageeditor.render.BitmapExporter]
+     * to scale strokes / text from canvas-px to bitmap-px so what the user saw
+     * matches what gets baked.
+     */
+    var canvasSizePx: IntSize by mutableStateOf(IntSize.Zero)
+        internal set
+
+    /** Intrinsic dimensions of the source bitmap, decoded once from the URI. */
+    var imageIntrinsicSize: IntSize by mutableStateOf(IntSize.Zero)
+        internal set
+
     // --- Rotate / flip ----------------------------------------------------
 
     /** Total rotation applied, always a multiple of 90°, normalized to [0, 360). */
@@ -42,12 +57,20 @@ class EditorState internal constructor(
     var flippedHorizontally: Boolean by mutableStateOf(false)
         internal set
 
-    fun rotate90Clockwise() {
+    fun rotate90Clockwise() = trace("imageeditor.transform.rotate") {
         rotationDegrees = (rotationDegrees + 90) % 360
     }
 
-    fun toggleHorizontalFlip() {
+    fun toggleHorizontalFlip() = trace("imageeditor.transform.flip") {
         flippedHorizontally = !flippedHorizontally
+    }
+
+    /**
+     * Switch the active tool. Routed through here (instead of a direct assignment to
+     * [activeTool]) so each switch lands in the perf dashboard as its own section.
+     */
+    fun selectTool(tool: EditorTool) = trace("imageeditor.tool.select") {
+        activeTool = tool
     }
 
     // --- Crop -------------------------------------------------------------
@@ -58,12 +81,12 @@ class EditorState internal constructor(
     var selectedAspectRatio: AspectRatioPreset by mutableStateOf(AspectRatioPreset.Free)
         internal set
 
-    fun resetCrop() {
+    fun resetCrop() = trace("imageeditor.crop.reset") {
         cropRect = CropRect.Full
         selectedAspectRatio = AspectRatioPreset.Free
     }
 
-    fun applyCrop(rect: CropRect, preset: AspectRatioPreset) {
+    fun applyCrop(rect: CropRect, preset: AspectRatioPreset) = trace("imageeditor.crop.apply") {
         cropRect = rect
         selectedAspectRatio = preset
     }
@@ -80,26 +103,48 @@ class EditorState internal constructor(
     )
         internal set
 
-    fun addPath(path: DrawingPath) {
+    fun addPath(path: DrawingPath) = trace("imageeditor.draw.stroke.commit") {
         drawnPaths.add(path)
     }
 
-    fun undoLastPath() {
+    fun undoLastPath() = trace("imageeditor.draw.undo") {
         if (drawnPaths.isNotEmpty()) {
             drawnPaths.removeAt(drawnPaths.lastIndex)
         }
     }
 
-    fun clearPaths() {
+    fun clearPaths() = trace("imageeditor.draw.clear") {
         drawnPaths.clear()
     }
 
-    fun setDrawColor(color: Color) {
+    fun setDrawColor(color: Color) = trace("imageeditor.draw.color.change") {
         drawColor = color
     }
 
-    fun setDrawStrokeWidth(widthDp: Float) {
+    fun setDrawStrokeWidth(widthDp: Float) = trace("imageeditor.draw.width.change") {
         drawStrokeWidthDp = widthDp
+    }
+
+    // --- Highlighter ------------------------------------------------------
+
+    var highlighterColor: Color by mutableStateOf(
+        // Default to a yellow-ish swatch from the palette; fall back to yellow
+        // (HEX FDD835 in our default palette) so the highlighter feels familiar.
+        config.drawingPalette.getOrNull(4) ?: Color(0xFFFDD835),
+    )
+        internal set
+
+    var highlighterStrokeWidthDp: Float by mutableStateOf(
+        config.highlighterStrokeWidthsDp.getOrNull(1) ?: 24f,
+    )
+        internal set
+
+    fun setHighlighterColor(color: Color) = trace("imageeditor.highlighter.color.change") {
+        highlighterColor = color
+    }
+
+    fun setHighlighterStrokeWidth(widthDp: Float) = trace("imageeditor.highlighter.width.change") {
+        highlighterStrokeWidthDp = widthDp
     }
 
     // --- Text -------------------------------------------------------------
@@ -108,20 +153,20 @@ class EditorState internal constructor(
 
     private var nextTextId: Long = 1L
 
-    fun addText(item: TextItem): TextItem {
+    fun addText(item: TextItem): TextItem = trace("imageeditor.text.add") {
         val withId = item.copy(id = nextTextId++)
         textItems.add(withId)
-        return withId
+        withId
     }
 
-    fun updateText(item: TextItem) {
+    fun updateText(item: TextItem) = trace("imageeditor.text.update") {
         val index = textItems.indexOfFirst { it.id == item.id }
         if (index >= 0) {
             textItems[index] = item
         }
     }
 
-    fun removeText(id: Long) {
+    fun removeText(id: Long) = trace("imageeditor.text.remove") {
         textItems.removeAll { it.id == id }
     }
 

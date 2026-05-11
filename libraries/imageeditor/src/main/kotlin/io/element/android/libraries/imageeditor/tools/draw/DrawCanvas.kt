@@ -25,6 +25,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntSize
+import io.element.android.libraries.core.perf.TracedGesture
 
 /**
  * Transparent canvas placed on top of the image. While [enabled] is true it captures
@@ -55,10 +56,12 @@ fun DrawCanvas(
     val currentStroke by rememberUpdatedState(strokeWidthDp)
     val onFinished by rememberUpdatedState(onPathFinished)
 
+    val gesture = remember { TracedGesture("imageeditor.draw.stroke") }
     val gestureModifier = if (enabled) {
         Modifier.pointerInput(Unit) {
             detectDragGestures(
                 onDragStart = { startOffset ->
+                    gesture.start()
                     livePoints.clear()
                     livePoints.add(startOffset.normalize(canvasSize))
                 },
@@ -67,6 +70,7 @@ fun DrawCanvas(
                     livePoints.add(change.position.normalize(canvasSize))
                 },
                 onDragEnd = {
+                    gesture.finish()
                     if (livePoints.size > 1) {
                         onFinished(
                             DrawingPath(
@@ -78,7 +82,10 @@ fun DrawCanvas(
                     }
                     livePoints.clear()
                 },
-                onDragCancel = { livePoints.clear() },
+                onDragCancel = {
+                    gesture.cancel()
+                    livePoints.clear()
+                },
             )
         }
     } else {

@@ -34,6 +34,18 @@ accompanist = "0.37.3"
 test_core = "1.7.0"
 roborazzi = "1.59.0"
 
+# Performance / tracing (see docs/perf_tracing.md)
+androidx_tracing = "1.3.0"
+androidx_benchmark = "1.4.1"
+androidx_uiautomator = "2.3.0"
+androidx_metrics_performance = "1.0.0-beta02"
+# Tencent Matrix APM — debug-only canaries (Resource leak, IO issue, ANR)
+matrix = "2.1.0"
+# Image-editing alternative-implementation modules (see :libraries:imageeditor-modular)
+ucrop = "2.2.11"
+androidx_ink = "1.0.0"
+photoeditor = "3.1.0"
+
 # Jetbrain
 datetime = "0.7.1"
 serialization_json = "1.11.0"
@@ -247,6 +259,36 @@ androidx-test-ext-junit = { group = "androidx.test.ext", name = "junit", version
 test_roborazzi = { module = "io.github.takahirom.roborazzi:roborazzi", version.ref = "roborazzi" }
 test_roborazzi_compose = { module = "io.github.takahirom.roborazzi:roborazzi-compose", version.ref = "roborazzi" }
 test_roborazzi_junit = { module = "io.github.takahirom.roborazzi:roborazzi-junit-rule", version.ref = "roborazzi" }
+
+# Performance / tracing
+androidx_tracing_ktx = { module = "androidx.tracing:tracing-ktx", version.ref = "androidx_tracing" }
+androidx_benchmark_macro_junit4 = { module = "androidx.benchmark:benchmark-macro-junit4", version.ref = "androidx_benchmark" }
+androidx_benchmark_common = { module = "androidx.benchmark:benchmark-common", version.ref = "androidx_benchmark" }
+androidx_uiautomator = { module = "androidx.test.uiautomator:uiautomator", version.ref = "androidx_uiautomator" }
+androidx_metrics_performance = { module = "androidx.metrics:metrics-performance", version.ref = "androidx_metrics_performance" }
+
+# Tencent Matrix (debug only — see :libraries:core-perf src/debug for usage)
+matrix_android_lib = { module = "com.tencent.matrix:matrix-android-lib", version.ref = "matrix" }
+matrix_android_commons = { module = "com.tencent.matrix:matrix-android-commons", version.ref = "matrix" }
+matrix_resource_canary_android = { module = "com.tencent.matrix:matrix-resource-canary-android", version.ref = "matrix" }
+matrix_resource_canary_common = { module = "com.tencent.matrix:matrix-resource-canary-common", version.ref = "matrix" }
+matrix_io_canary = { module = "com.tencent.matrix:matrix-io-canary", version.ref = "matrix" }
+matrix_trace_canary = { module = "com.tencent.matrix:matrix-trace-canary", version.ref = "matrix" }
+
+# uCrop — View-based cropper used by :libraries:imageeditor-modular
+ucrop = { module = "com.github.yalantis:ucrop", version.ref = "ucrop" }
+
+# Jetpack Ink API — Compose-first low-latency drawing, used by :libraries:imageeditor-modular
+androidx_ink_authoring = { module = "androidx.ink:ink-authoring-compose", version.ref = "androidx_ink" }
+androidx_ink_brush = { module = "androidx.ink:ink-brush-compose", version.ref = "androidx_ink" }
+androidx_ink_geometry = { module = "androidx.ink:ink-geometry-compose", version.ref = "androidx_ink" }
+androidx_ink_rendering = { module = "androidx.ink:ink-rendering", version.ref = "androidx_ink" }
+androidx_ink_strokes = { module = "androidx.ink:ink-strokes", version.ref = "androidx_ink" }
+androidx_ink_nativeloader = { module = "androidx.ink:ink-nativeloader", version.ref = "androidx_ink" }
+
+# burhanrashid52/PhotoEditor — all-in-one View-based editor (drawing, text, emoji, filters, shapes)
+# used by :libraries:imageeditor-photoeditor as the third comparison point
+photoeditor = { module = "com.burhanrashid52:photoeditor", version.ref = "photoeditor" }
 
 [bundles]
 

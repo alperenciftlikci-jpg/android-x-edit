@@ -1,7 +1,31 @@
 {
   "permissions": {
     "allow": [
-      "WebSearch"
+      "WebSearch",
+      "Bash(adb -s emulator-5554 shell 'pm uninstall com.example.tooltipplayground')",
+      "Bash(adb -s emulator-5554 shell 'run-as io.element.android.x.debug du -sh cache code_cache files databases shared_prefs 2>/dev/null')",
+      "Bash(adb -s emulator-5554 shell 'du -sh /sdcard/Android/data/io.element.android.x.debug/* 2>/dev/null')",
+      "Bash(JAVA_HOME=\"C:/Program Files/Android/Android Studio/jbr\" ./gradlew :libraries:imageeditor-native:assembleDebug --no-daemon)",
+      "Bash(ls -la \"C:/AlperenCiftlikciMobile/Telegram\" 2>&1 | head -20)",
+      "Read(//c/AlperenCiftlikciMobile/Telegram/**)",
+      "Bash(JAVA_HOME=\"C:/Program Files/Android/Android Studio/jbr\" ./gradlew :libraries:videoeditor-native:assembleDebug --no-daemon)",
+      "Bash(JAVA_HOME=\"C:/Program Files/Android/Android Studio/jbr\" ./gradlew :libraries:videoeditor-native:compileDebugKotlin --no-daemon)",
+      "Bash(JAVA_HOME=\"C:/Program Files/Android/Android Studio/jbr\" ./gradlew :libraries:imageeditor-native:compileDebugKotlin :features:messages:impl:compileDebugKotlin --no-daemon)",
+      "Bash(JAVA_HOME=\"C:/Program Files/Android/Android Studio/jbr\" ./gradlew :libraries:imageeditor-native:compileDebugKotlin --no-daemon)",
+      "Bash(JAVA_HOME=\"C:/Program Files/Android/Android Studio/jbr\" ./gradlew :features:messages:impl:compileDebugKotlin --no-daemon)",
+      "Bash(JAVA_HOME=\"C:/Program Files/Android/Android Studio/jbr\" ./gradlew :libraries:videoeditor-native:compileDebugKotlin :features:messages:impl:compileDebugKotlin --no-daemon)",
+      "Bash(JAVA_HOME=\"C:/Program Files/Android/Android Studio/jbr\" ./gradlew :libraries:imageeditor-native:compileDebugKotlin :libraries:videoeditor-native:compileDebugKotlin :features:messages:impl:compileDebugKotlin --no-daemon)",
+      "Bash(JAVA_HOME=\"C:/Program Files/Android/Android Studio/jbr\" ./gradlew :libraries:imageeditor-native:compileDebugKotlin :libraries:videoeditor-native:compileDebugKotlin --no-daemon)",
+      "Bash(./gradlew :libraries:videoeditor-native:compileDebugKotlin --no-daemon)",
+      "PowerShell($env:JAVA_HOME = \"C:\\\\Program Files\\\\Java\\\\jdk-17\"; $env:PATH = \"$env:JAVA_HOME\\\\bin;$env:PATH\"; & .\\\\gradlew.bat \":libraries:videoeditor-native:compileDebugKotlin\" --no-daemon 2>&1 | Select-Object -Last 80)",
+      "PowerShell($env:JAVA_HOME = \"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; $env:PATH = \"$env:JAVA_HOME\\\\bin;$env:PATH\"; & .\\\\gradlew.bat \":libraries:videoeditor-native:compileDebugKotlin\" --no-daemon 2>&1 | Select-Object -Last 60)",
+      "PowerShell($env:JAVA_HOME = \"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; $env:PATH = \"$env:JAVA_HOME\\\\bin;$env:PATH\"; & .\\\\gradlew.bat \":libraries:imageeditor-native:compileDebugKotlin\" \":features:messages:impl:compileDebugKotlin\" --no-daemon 2>&1 | Select-Object -Last 50)",
+      "PowerShell($env:JAVA_HOME = \"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; $env:PATH = \"$env:JAVA_HOME\\\\bin;$env:PATH\"; & .\\\\gradlew.bat \":libraries:imageeditor-native:compileDebugKotlin\" --no-daemon 2>&1 | Select-Object -Last 50)",
+      "PowerShell($env:JAVA_HOME = \"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; $env:PATH = \"$env:JAVA_HOME\\\\bin;$env:PATH\"; & .\\\\gradlew.bat \":libraries:imageeditor-native:compileDebugKotlin\" --no-daemon 2>&1 | Select-Object -Last 30)",
+      "PowerShell($env:JAVA_HOME = \"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; $env:PATH = \"$env:JAVA_HOME\\\\bin;$env:PATH\"; & .\\\\gradlew.bat \":libraries:imageeditor-native:externalNativeBuildDebug\" --no-daemon 2>&1 | Select-Object -Last 60)",
+      "PowerShell($env:JAVA_HOME = \"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; $env:PATH = \"$env:JAVA_HOME\\\\bin;$env:PATH\"; & .\\\\gradlew.bat \":libraries:videoeditor-native:compileDebugKotlin\" --no-daemon 2>&1 | Select-Object -Last 30)",
+      "PowerShell($env:JAVA_HOME = \"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; $env:PATH = \"$env:JAVA_HOME\\\\bin;$env:PATH\"; & .\\\\gradlew.bat \":libraries:videoeditor-native:compileDebugKotlin\" \":libraries:imageeditor-native:compileDebugKotlin\" \":features:messages:impl:compileDebugKotlin\" --no-daemon 2>&1 | Select-Object -Last 30)",
+      "PowerShell($env:JAVA_HOME = \"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; $env:PATH = \"$env:JAVA_HOME\\\\bin;$env:PATH\"; & .\\\\gradlew.bat \":libraries:imageeditor-native:assembleDebug\" \":libraries:videoeditor-native:assembleDebug\" --no-daemon 2>&1 | Select-Object -Last 25)"
     ]
   }
 }
