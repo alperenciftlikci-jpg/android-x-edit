@@ -6,6 +6,7 @@
 // paint compositing.
 #pragma once
 
+#include "../blur/BlurredSource.h"
 #include "../crop/CropEngine.h"
 #include "../crop/CropParams.h"
 #include "../filters/FilterChain.h"
@@ -72,6 +73,19 @@ private:
     PaintEngine paintEngine_;
     bool paintEngineSized_ = false;
     Shader composeShader_;        // src-over composite of paint layer onto filtered+cropped
+
+    // Blur brush pipeline. Source is blurred once on upload (BlurredSource), then
+    // BlurBrush strokes accumulate into a mask FBO inside PaintEngine; the
+    // `blurRevealShader_` pass mixes the blurred copy back in wherever the mask
+    // is opaque. Pre-blurring on upload keeps per-frame export cost flat —
+    // mask-stroke editing becomes a cheap mix(), not a per-frame Gaussian.
+    BlurredSource blurredSource_;
+    bool blurredSourceSized_ = false;
+    Shader blurRevealShader_;
+    // Tunable strength of the pre-blur (Gaussian sigma in source pixels). 6
+    // gives a visibly blurred but still-recognisable photo — matches Telegram's
+    // blur brush intensity.
+    float blurSigma_ = 6.f;
 
     TextLayer textLayer_;
     bool textLayerSized_ = false;

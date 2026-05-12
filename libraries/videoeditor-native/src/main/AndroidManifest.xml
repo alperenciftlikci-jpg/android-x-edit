@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!--
+        Permissions for the custom MediaStore-based video picker. Telegram-style
+        "real filesystem path" access — avoids PhotoPicker's FUSE-backed sandbox
+        URIs that bottleneck trim/export on emulators.
+
+        - READ_MEDIA_VIDEO (API 33+): scoped permission for video files only
+        - READ_EXTERNAL_STORAGE (≤ API 32): legacy permission, capped to SDK 32
+    -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+</manifest>

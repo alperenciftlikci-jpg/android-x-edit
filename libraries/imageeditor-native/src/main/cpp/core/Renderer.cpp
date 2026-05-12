@@ -82,6 +82,38 @@ bool Renderer::init() {
         PE_LOGE("Renderer: compose shader compile failed");
         return false;
     }
+
+    // Blur reveal: where the brush mask is opaque, swap the composed image's
+    // RGB for the pre-blurred source's RGB. Alpha is preserved from the base,
+    // so the reveal never punches through a previously-transparent pixel.
+    // `mix(base.rgb, blurred.rgb, mask.a)` is the same compositing op
+    // Telegram's Brush.Blurer uses on its native side.
+    static constexpr const char* kBlurRevealFs = R"(#version 300 es
+        precision highp float;
+        uniform sampler2D u_base;
+        uniform sampler2D u_blurred;
+        uniform sampler2D u_blurMask;
+        in vec2 v_uv;
+        out vec4 fragColor;
+        void main() {
+            vec4 base = texture(u_base, v_uv);
+            vec3 blurredRgb = texture(u_blurred, v_uv).rgb;
+            float maskA = texture(u_blurMask, v_uv).a;
+            fragColor = vec4(mix(base.rgb, blurredRgb, maskA), base.a);
+        }
+    )";
+    if (!blurRevealShader_.compile(R"(#version 300 es
+        layout(location = 0) in vec2 a_pos;
+        layout(location = 1) in vec2 a_uv;
+        out vec2 v_uv;
+        void main() {
+            v_uv = a_uv;
+            gl_Position = vec4(a_pos, 0.0, 1.0);
+        }
+    )", kBlurRevealFs)) {
+        PE_LOGE("Renderer: blur reveal shader compile failed");
+        return false;
+    }
     return true;
 }
 
@@ -96,6 +128,8 @@ bool Renderer::makeContextCurrent() {
 
 void Renderer::release() {
     textLayer_.release();
+    blurRevealShader_.release();
+    blurredSource_.release();
     paintEngine_.release();
     composeShader_.release();
     cropEngine_.release();
@@ -109,6 +143,7 @@ void Renderer::release() {
     }
     filterChainSized_ = false;
     paintEngineSized_ = false;
+    blurredSourceSized_ = false;
     textLayerSized_ = false;
     sourceW_ = sourceH_ = 0;
 }
@@ -160,6 +195,26 @@ bool Renderer::setSourceBitmap(const uint8_t* rgba, int width, int height) {
         }
         textLayerSized_ = true;
     }
+
+    // Pre-blur the source once per upload. The blur brush only ever needs to
+    // mix the result in via mask — re-running the Gaussian on every export
+    // would dominate the pipeline's GPU budget (25-tap * 2 passes).
+    if (!blurredSourceSized_) {
+        if (!blurredSource_.init(width, height)) {
+            PE_LOGE("BlurredSource init failed");
+            return false;
+        }
+        blurredSourceSized_ = true;
+    } else {
+        if (!blurredSource_.resize(width, height)) {
+            PE_LOGE("BlurredSource resize failed");
+            return false;
+        }
+    }
+    if (!blurredSource_.process(sourceTex_, blurSigma_)) {
+        PE_LOGE("BlurredSource process failed");
+        return false;
+    }
     return true;
 }
 
@@ -201,18 +256,38 @@ bool Renderer::exportToBitmap(uint8_t* outRgba, int outWidth, int outHeight) {
     quad_.draw();
     Framebuffer::bindDefault();
 
-    // Text composite — drawn on top of paint, so a text item placed over a
-    // stroke remains readable.
-    textLayer_.composite(composedFbo);
+    // Blur reveal pass: mix in the pre-blurred source wherever the blur-brush
+    // mask is opaque. Always run — a fully-empty mask is a no-op mix(base, _, 0)
+    // and costs one full-screen quad with three samples per fragment (cheap
+    // compared to the filter chain that just ran). Output lands in
+    // `revealedFbo`, which becomes the texture downstream stages consume.
+    Framebuffer revealedFbo;
+    if (!revealedFbo.create(sourceW_, sourceH_)) return false;
+    revealedFbo.bind();
+    glClearColor(0.f, 0.f, 0.f, 0.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    blurRevealShader_.use();
+    composedFbo.texture().bind(GL_TEXTURE0);
+    blurredSource_.texture().bind(GL_TEXTURE1);
+    paintEngine_.blurMaskTexture().bind(GL_TEXTURE2);
+    blurRevealShader_.setInt("u_base", 0);
+    blurRevealShader_.setInt("u_blurred", 1);
+    blurRevealShader_.setInt("u_blurMask", 2);
+    quad_.draw();
+    Framebuffer::bindDefault();
+
+    // Text composite — drawn on top of paint + blur, so a text item placed
+    // over a stroke / blurred region remains readable.
+    textLayer_.composite(revealedFbo);
 
     // Crop pass (only when params != identity).
-    const Texture* postCrop = &composedFbo.texture();
+    const Texture* postCrop = &revealedFbo.texture();
     Framebuffer cropFbo;
     if (!cropParams_.isIdentity()) {
         int cropW, cropH;
         cropEngine_.outputSize(cropParams_, sourceW_, sourceH_, cropW, cropH);
         if (!cropFbo.create(cropW, cropH)) return false;
-        if (!cropEngine_.process(composedFbo.texture(), cropParams_, cropFbo)) return false;
+        if (!cropEngine_.process(revealedFbo.texture(), cropParams_, cropFbo)) return false;
         postCrop = &cropFbo.texture();
     }
 

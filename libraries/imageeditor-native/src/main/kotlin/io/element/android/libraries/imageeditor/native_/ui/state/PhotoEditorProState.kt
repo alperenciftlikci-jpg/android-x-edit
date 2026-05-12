@@ -67,7 +67,8 @@ class PhotoEditorProState {
         val target = (minDim / 200f).coerceIn(2f, 18f)
         brush = brush.copy(radiusPx = target)
     }
-    val paintStrokesCommitted: SnapshotStateList<Long> = mutableStateListOf()  // ids for undo affordance
+    val paintStrokesCommitted: SnapshotStateList<Long> = mutableStateListOf()  // colour-brush stroke ids — drives Paint-tab undo + preview re-render
+    val blurStrokesCommitted: SnapshotStateList<Long> = mutableStateListOf()   // BlurBrush stroke ids — independent stack for Blur-tab undo
     /** Bumped on every paint-stroke pointer sample. Driver for live preview re-renders during
      *  drawing; the screen's snapshotFlow watches this so the user sees their stroke build up
      *  on-canvas in real time, not only after lifting the finger. */
@@ -195,6 +196,7 @@ class PhotoEditorProState {
         cropAspectLocked = null
         textItems.clear()
         paintStrokesCommitted.clear()
+        blurStrokesCommitted.clear()
         editingTextId = null
     }
 

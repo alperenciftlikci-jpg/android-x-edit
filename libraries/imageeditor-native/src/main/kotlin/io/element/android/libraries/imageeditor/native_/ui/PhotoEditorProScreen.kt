@@ -206,6 +206,7 @@ fun PhotoEditorProScreen(
                 params = state.params,
                 crop = state.crop,
                 paintCommittedSize = state.paintStrokesCommitted.size,
+                blurCommittedSize = state.blurStrokesCommitted.size,
                 paintTick = state.paintStrokeTick,
                 textCount = state.textItems.size,
                 textTick = state.textTick,
@@ -314,10 +315,41 @@ fun PhotoEditorProScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             TopBarIconButton(Icons.Filled.Close, "Cancel", Color.White, onClick = onCancel)
-            if (state.selectedTab == PhotoEditorProState.Tab.Paint) {
-                Spacer(Modifier.size(4.dp))
-                TopBarIconButton(Icons.Filled.Undo, "Undo", Color.White,
-                    onClick = { nativeEditor.undoPaint() })
+            // Per-tab undo. Paint tab pops a paint stroke; Blur tab pops a blur-brush
+            // stroke (the two stacks are independent on the native side). Pop the
+            // matching Kotlin-side list too — without that, PreviewKey wouldn't change
+            // and the user's last stroke would still be visible on screen even though
+            // the native FBO already rolled back.
+            when (state.selectedTab) {
+                PhotoEditorProState.Tab.Paint -> {
+                    if (state.paintStrokesCommitted.isNotEmpty()) {
+                        Spacer(Modifier.size(4.dp))
+                        TopBarIconButton(Icons.Filled.Undo, "Undo", Color.White,
+                            onClick = {
+                                // Re-check on click — rapid taps queue up faster than the
+                                // recomposition that hides the button, so a second tap can
+                                // fire when the list is already empty. lastIndex on an empty
+                                // list is -1 and removeAt(-1) crashes the input thread.
+                                if (state.paintStrokesCommitted.isNotEmpty()) {
+                                    nativeEditor.undoPaint()
+                                    state.paintStrokesCommitted.removeAt(state.paintStrokesCommitted.lastIndex)
+                                }
+                            })
+                    }
+                }
+                PhotoEditorProState.Tab.Blur -> {
+                    if (state.blurStrokesCommitted.isNotEmpty()) {
+                        Spacer(Modifier.size(4.dp))
+                        TopBarIconButton(Icons.Filled.Undo, "Undo", Color.White,
+                            onClick = {
+                                if (state.blurStrokesCommitted.isNotEmpty()) {
+                                    nativeEditor.undoBlur()
+                                    state.blurStrokesCommitted.removeAt(state.blurStrokesCommitted.lastIndex)
+                                }
+                            })
+                    }
+                }
+                else -> Unit
             }
             Spacer(Modifier.weight(1f))
             BasicText(
@@ -356,20 +388,58 @@ fun PhotoEditorProScreen(
             // Tab-specific overlays.
             when (state.selectedTab) {
                 PhotoEditorProState.Tab.Blur -> {
-                    if (state.params.blur.type != BlurType.Off) {
-                        TelegramRadialBlurControl(
-                            type = state.params.blur.type,
-                            centerX = state.params.blur.centerX,
-                            centerY = state.params.blur.centerY,
-                            innerRadius = state.params.blur.innerRadius,
-                            outerRadius = state.params.blur.outerRadius,
-                            angleRadians = state.params.blur.angleRadians,
-                            onCenterChange = state::setBlurCenter,
-                            onInnerRadiusChange = state::setBlurInnerRadius,
-                            onOuterRadiusChange = state::setBlurOuterRadius,
-                            onAngleChange = state::setBlurAngle,
-                            modifier = Modifier.fillMaxSize().padding(8.dp),
-                        )
+                    when {
+                        // Brush mode: same touch pipeline as the Paint tab, but the brush
+                        // is locked to BlurBrush and strokes land on the blur-mask FBO via
+                        // the native side's per-brush-type dispatch.
+                        state.brush.type == BrushType.BlurBrush -> {
+                            val src = sourceBitmap
+                            if (src != null) {
+                                val lastTick = remember { object { var t = 0L } }
+                                fun bumpLivePaint() {
+                                    val now = System.currentTimeMillis()
+                                    if (now - lastTick.t >= 16L) {
+                                        lastTick.t = now
+                                        state.paintStrokeTick++
+                                    }
+                                }
+                                TelegramDrawingCanvas(
+                                    enabled = true,
+                                    sourceWidth = src.width,
+                                    sourceHeight = src.height,
+                                    cropParams = state.crop,
+                                    onStrokeBegin = { x, y, p ->
+                                        nativeEditor.beginStroke(state.brush, x, y, p)
+                                        state.paintStrokeTick++
+                                    },
+                                    onStrokeExtend = { x, y, p ->
+                                        nativeEditor.extendStroke(x, y, p)
+                                        bumpLivePaint()
+                                    },
+                                    onStrokeEnd = {
+                                        nativeEditor.endStroke()
+                                        state.blurStrokesCommitted.add(System.nanoTime())
+                                        state.paintStrokeTick++
+                                    },
+                                    modifier = Modifier.fillMaxSize().padding(8.dp),
+                                )
+                            }
+                        }
+                        state.params.blur.type != BlurType.Off -> {
+                            TelegramRadialBlurControl(
+                                type = state.params.blur.type,
+                                centerX = state.params.blur.centerX,
+                                centerY = state.params.blur.centerY,
+                                innerRadius = state.params.blur.innerRadius,
+                                outerRadius = state.params.blur.outerRadius,
+                                angleRadians = state.params.blur.angleRadians,
+                                onCenterChange = state::setBlurCenter,
+                                onInnerRadiusChange = state::setBlurInnerRadius,
+                                onOuterRadiusChange = state::setBlurOuterRadius,
+                                onAngleChange = state::setBlurAngle,
+                                modifier = Modifier.fillMaxSize().padding(8.dp),
+                            )
+                        }
                     }
                 }
                 PhotoEditorProState.Tab.Crop -> {
@@ -428,7 +498,14 @@ fun PhotoEditorProScreen(
                             },
                             onStrokeEnd = {
                                 nativeEditor.endStroke()
-                                state.paintStrokesCommitted.add(System.nanoTime())
+                                // BlurBrush writes to a different native FBO + snapshot stack,
+                                // so it must record on the matching Kotlin-side list — that's
+                                // what the Blur-tab undo button pops from.
+                                if (state.brush.type == BrushType.BlurBrush) {
+                                    state.blurStrokesCommitted.add(System.nanoTime())
+                                } else {
+                                    state.paintStrokesCommitted.add(System.nanoTime())
+                                }
                                 // Final render unconditionally — guarantees the last few
                                 // pointer samples (potentially within the 16 ms throttle
                                 // window) make it into the visible preview.
@@ -580,7 +657,18 @@ fun PhotoEditorProScreen(
                     TabItem(PhotoEditorProState.Tab.Text,    "Text",    Icons.Filled.TextFields),
                 ),
                 selected = state.selectedTab,
-                onSelect = { state.selectedTab = it },
+                onSelect = { newTab ->
+                    // Tabs own which brush type is live. Switching INTO Paint while the
+                    // BlurBrush is still selected (because the user was just in the Blur
+                    // tab's Brush mode) would silently route paint strokes to the blur
+                    // mask layer — reset to Pen so the Paint chip selection reflects
+                    // reality on entry.
+                    if (newTab == PhotoEditorProState.Tab.Paint &&
+                        state.brush.type == BrushType.BlurBrush) {
+                        state.setBrushType(BrushType.Pen)
+                    }
+                    state.selectedTab = newTab
+                },
                 accentColor = TelegramAccent,
             )
         }
@@ -729,23 +817,54 @@ private fun EffectsTabContent(state: PhotoEditorProState) {
 @Composable
 private fun BlurTabContent(state: PhotoEditorProState) {
     val p = state.params
+    // Two distinct mechanisms share this tab:
+    //   • Radial / Linear: filter-style gaussian masked by a shape, parameter-driven.
+    //   • Brush: a paint-style overlay where the user paints a mask and the native
+    //     reveal pass mixes a pre-blurred copy of the source through that mask.
+    // They're mutually exclusive at the UI level: picking one resets the other so the
+    // controls below the pill row always describe the active mode.
+    val isBrushMode = state.brush.type == BrushType.BlurBrush
     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            ModePill("Off",    p.blur.type == BlurType.Off)    { state.setBlurType(BlurType.Off) }
-            ModePill("Radial", p.blur.type == BlurType.Radial) { state.setBlurType(BlurType.Radial) }
-            ModePill("Linear", p.blur.type == BlurType.Linear) { state.setBlurType(BlurType.Linear) }
+            ModePill("Off", !isBrushMode && p.blur.type == BlurType.Off) {
+                state.setBlurType(BlurType.Off)
+                if (isBrushMode) state.setBrushType(BrushType.Pen)
+            }
+            ModePill("Radial", !isBrushMode && p.blur.type == BlurType.Radial) {
+                state.setBlurType(BlurType.Radial)
+                if (isBrushMode) state.setBrushType(BrushType.Pen)
+            }
+            ModePill("Linear", !isBrushMode && p.blur.type == BlurType.Linear) {
+                state.setBlurType(BlurType.Linear)
+                if (isBrushMode) state.setBrushType(BrushType.Pen)
+            }
+            ModePill("Brush", isBrushMode) {
+                state.setBlurType(BlurType.Off)
+                state.setBrushType(BrushType.BlurBrush)
+            }
         }
-        TelegramSimpleSlider(
-            label = "Strength",
-            value = p.blur.strength,
-            range = 0f..1f,
-            onValueChange = state::setBlurStrength,
-            defaultValue = 0.6f,
-            accentColor = TelegramAccent,
-        )
+        if (isBrushMode) {
+            TelegramSimpleSlider(
+                label = "Size",
+                value = state.brush.radiusPx,
+                range = 2f..48f,
+                onValueChange = state::setBrushSize,
+                defaultValue = 12f,
+                accentColor = TelegramAccent,
+            )
+        } else {
+            TelegramSimpleSlider(
+                label = "Strength",
+                value = p.blur.strength,
+                range = 0f..1f,
+                onValueChange = state::setBlurStrength,
+                defaultValue = 0.6f,
+                accentColor = TelegramAccent,
+            )
+        }
     }
 }
 
@@ -852,7 +971,9 @@ private fun PaintTabContent(state: PhotoEditorProState) {
             }
         }
         Spacer(Modifier.height(8.dp))
-        // Brush type pill row.
+        // Brush type pill row. BlurBrush isn't surfaced here — it's exposed as a mode in
+        // the Blur tab instead, alongside Radial / Linear, because conceptually it belongs
+        // with the other blur tools.
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
             BrushTypeChip("Pen",    state.brush.type == BrushType.Pen)    { state.setBrushType(BrushType.Pen) }
             BrushTypeChip("Marker", state.brush.type == BrushType.Marker) { state.setBrushType(BrushType.Marker) }
@@ -1213,6 +1334,7 @@ private data class PreviewKey(
     val params: io.element.android.libraries.imageeditor.native_.FilterParams,
     val crop: io.element.android.libraries.imageeditor.native_.CropParams,
     val paintCommittedSize: Int,
+    val blurCommittedSize: Int,
     val paintTick: Long,
     val textCount: Int,
     val textTick: Long,

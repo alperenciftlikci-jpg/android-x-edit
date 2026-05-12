@@ -9,11 +9,12 @@
 namespace photoedit {
 
 enum class BrushType : int {
-    Pen     = 0,    // hard-edge solid disc
-    Marker  = 1,    // soft-edge translucent disc, builds up on overlap
-    Neon    = 2,    // glow (large, soft, additive) + core (small, hard)
-    Arrow   = 3,    // pen path + arrowhead at the final segment
-    Eraser  = 4,    // sets dst.a = 0 within the stamp radius
+    Pen        = 0, // hard-edge solid disc
+    Marker     = 1, // soft-edge translucent disc, builds up on overlap
+    Neon       = 2, // glow (large, soft, additive) + core (small, hard)
+    Arrow      = 3, // pen path + arrowhead at the final segment
+    Eraser     = 4, // sets dst.a = 0 within the stamp radius
+    BlurBrush  = 5, // stamps a soft mask; reveal pass replaces those pixels with a pre-blurred copy of the source
 };
 
 struct BrushParams {

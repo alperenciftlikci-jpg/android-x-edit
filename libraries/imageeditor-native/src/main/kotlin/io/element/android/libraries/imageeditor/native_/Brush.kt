@@ -16,6 +16,14 @@ enum class BrushType(val ordinalForJni: Int) {
     Neon(2),
     Arrow(3),
     Eraser(4),
+
+    /**
+     * Blur brush — stamps a soft mask into a dedicated FBO on the native side.
+     * The renderer's reveal pass then mixes a pre-blurred copy of the source
+     * into the composed image wherever that mask is opaque. Per-stroke colour
+     * is ignored (the mask is colour-agnostic); only [Brush.radiusPx] matters.
+     */
+    BlurBrush(5),
 }
 
 data class Brush(

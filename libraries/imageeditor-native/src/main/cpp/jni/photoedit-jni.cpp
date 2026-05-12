@@ -216,14 +216,28 @@ JNIEXPORT void JNICALL
 Java_io_element_android_libraries_imageeditor_native_1_NativePhotoEditor_nativeUndoPaint(
         JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
     auto* e = asEditor(handle);
-    if (e && e->makeContextCurrent() && e->paint()) e->paint()->undo();
+    if (e && e->makeContextCurrent() && e->paint()) e->paint()->undoPaintLayer();
 }
 
 JNIEXPORT void JNICALL
 Java_io_element_android_libraries_imageeditor_native_1_NativePhotoEditor_nativeRedoPaint(
         JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
     auto* e = asEditor(handle);
-    if (e && e->makeContextCurrent() && e->paint()) e->paint()->redo();
+    if (e && e->makeContextCurrent() && e->paint()) e->paint()->redoPaintLayer();
+}
+
+JNIEXPORT void JNICALL
+Java_io_element_android_libraries_imageeditor_native_1_NativePhotoEditor_nativeUndoBlur(
+        JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+    auto* e = asEditor(handle);
+    if (e && e->makeContextCurrent() && e->paint()) e->paint()->undoBlurLayer();
+}
+
+JNIEXPORT void JNICALL
+Java_io_element_android_libraries_imageeditor_native_1_NativePhotoEditor_nativeRedoBlur(
+        JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+    auto* e = asEditor(handle);
+    if (e && e->makeContextCurrent() && e->paint()) e->paint()->redoBlurLayer();
 }
 
 JNIEXPORT void JNICALL

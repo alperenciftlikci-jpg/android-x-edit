@@ -28,6 +28,10 @@ set(SRC_PAINT
     paint/PaintEngine.cpp
 )
 
+set(SRC_BLUR
+    blur/BlurredSource.cpp
+)
+
 set(SRC_TEXT
     text/TextLayer.cpp
 )
@@ -46,6 +50,7 @@ add_library(photoedit SHARED
     ${SRC_FILTERS}
     ${SRC_CROP}
     ${SRC_PAINT}
+    ${SRC_BLUR}
     ${SRC_TEXT}
     ${SRC_JNI}
     ${SRC_FACADE}

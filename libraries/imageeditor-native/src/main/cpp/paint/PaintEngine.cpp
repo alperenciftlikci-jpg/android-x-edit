@@ -122,12 +122,15 @@ bool PaintEngine::resize(int width, int height) {
 void PaintEngine::release() {
     paintFbo_.release();
     scratchFbo_.release();
+    blurMaskFbo_.release();
     penShader_.release();
     markerShader_.release();
     neonShader_.release();
     stampQuad_.release();
     undoableSnapshots_.clear();
     redoableSnapshots_.clear();
+    undoableBlurSnapshots_.clear();
+    redoableBlurSnapshots_.clear();
     rawPoints_.clear();
     densified_.clear();
     inStroke_ = false;
@@ -143,7 +146,11 @@ bool PaintEngine::compileShaders() {
 bool PaintEngine::initFbos(int width, int height) {
     if (!paintFbo_.create(width, height)) return false;
     if (!scratchFbo_.create(width, height)) return false;
+    if (!blurMaskFbo_.create(width, height)) return false;
     paintFbo_.bind();
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    blurMaskFbo_.bind();
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT);
     Framebuffer::bindDefault();
@@ -251,7 +258,17 @@ void PaintEngine::endStroke() {
         }
     }
 
-    pushUndoSnapshot();
+    // Snapshot the layer the current brush actually wrote to. BlurBrush pushes
+    // to the blur stack; everything else (pen / marker / neon / arrow / eraser)
+    // pushes to the paint stack. Keeping the two stacks decoupled lets each
+    // tool tab undo independently of the other.
+    if (currentBrush_.type == BrushType::BlurBrush) {
+        pushSnapshot(blurMaskFbo_, undoableBlurSnapshots_, /*capToMax=*/true);
+        redoableBlurSnapshots_.clear();
+    } else {
+        pushSnapshot(paintFbo_, undoableSnapshots_, /*capToMax=*/true);
+        redoableSnapshots_.clear();
+    }
     inStroke_ = false;
     rawPoints_.clear();
     densified_.clear();
@@ -279,7 +296,16 @@ void PaintEngine::densify(const StrokePoint& p0, const StrokePoint& p1) {
 void PaintEngine::renderStamps() {
     if (densified_.empty()) return;
 
-    paintFbo_.bind();
+    // BlurBrush has its own destination FBO — it doesn't write colour into the
+    // paint layer at all, it just builds up an alpha mask the renderer's reveal
+    // pass samples. Everything else (Pen, Marker, Neon, Arrow, Eraser) targets
+    // the regular paint layer.
+    const bool isBlur = currentBrush_.type == BrushType::BlurBrush;
+    if (isBlur) {
+        blurMaskFbo_.bind();
+    } else {
+        paintFbo_.bind();
+    }
     glEnable(GL_BLEND);
     if (currentBrush_.type == BrushType::Eraser) {
         // Standard "destination-out" against premultiplied paint: result = dst * (1 - src.a).
@@ -291,25 +317,33 @@ void PaintEngine::renderStamps() {
         // Additive — halos overlap to brighten.
         glBlendFunc(GL_ONE, GL_ONE);
     } else {
-        // Standard premultiplied src-over.
+        // Standard premultiplied src-over. BlurBrush uses this too — overlapping
+        // stamps just saturate the mask towards alpha=1 (= full blur reveal).
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     }
 
     Shader* s = nullptr;
     switch (currentBrush_.type) {
-        case BrushType::Marker: s = &markerShader_; break;
-        case BrushType::Neon:   s = &neonShader_;   break;
+        case BrushType::Marker:    s = &markerShader_; break;
+        case BrushType::Neon:      s = &neonShader_;   break;
+        case BrushType::BlurBrush: s = &markerShader_; break;   // soft disc, same falloff as marker
         case BrushType::Pen:
         case BrushType::Arrow:
         case BrushType::Eraser:
-        default:                s = &penShader_;    break;
+        default:                   s = &penShader_;    break;
     }
     s->use();
-    s->setVec4("u_color",
-               currentBrush_.r * currentBrush_.a,
-               currentBrush_.g * currentBrush_.a,
-               currentBrush_.b * currentBrush_.a,
-               currentBrush_.a);
+    if (isBlur) {
+        // Mask only — keep RGB at 0 so the mask FBO contents are unambiguous
+        // when sampled (only .a carries information).
+        s->setVec4("u_color", 0.f, 0.f, 0.f, 1.f);
+    } else {
+        s->setVec4("u_color",
+                   currentBrush_.r * currentBrush_.a,
+                   currentBrush_.g * currentBrush_.a,
+                   currentBrush_.b * currentBrush_.a,
+                   currentBrush_.a);
+    }
     s->setVec2("u_layerSize", static_cast<float>(width_), static_cast<float>(height_));
     if (currentBrush_.type == BrushType::Pen ||
         currentBrush_.type == BrushType::Arrow ||
@@ -340,56 +374,35 @@ void PaintEngine::renderStamps() {
     Framebuffer::bindDefault();
 }
 
-bool PaintEngine::pushUndoSnapshot() {
+bool PaintEngine::pushSnapshot(Framebuffer& fbo,
+                               std::vector<std::unique_ptr<Texture>>& stack,
+                               bool capToMax) {
     auto snap = std::make_unique<Texture>();
     if (!snap->createEmpty(width_, height_)) return false;
 
-    // Copy the current paint layer into the snapshot via a draw call. We use
-    // glCopyTexSubImage2D when the FBO is bound — fastest path on tile GPUs.
-    paintFbo_.bind();
+    // Copy the FBO's colour attachment into the snapshot via glCopyTexSubImage2D
+    // — fastest path on tile GPUs (no driver-level shader, no readback).
+    fbo.bind();
     glBindTexture(GL_TEXTURE_2D, snap->id());
     glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width_, height_);
     glBindTexture(GL_TEXTURE_2D, 0);
     Framebuffer::bindDefault();
 
-    if (undoableSnapshots_.size() >= kMaxSnapshots) {
-        undoableSnapshots_.erase(undoableSnapshots_.begin());
+    if (capToMax && stack.size() >= kMaxSnapshots) {
+        stack.erase(stack.begin());
     }
-    undoableSnapshots_.push_back(std::move(snap));
+    stack.push_back(std::move(snap));
     return true;
 }
 
-bool PaintEngine::pushRedoSnapshot() {
-    auto snap = std::make_unique<Texture>();
-    if (!snap->createEmpty(width_, height_)) return false;
-    paintFbo_.bind();
-    glBindTexture(GL_TEXTURE_2D, snap->id());
-    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width_, height_);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    Framebuffer::bindDefault();
-    redoableSnapshots_.push_back(std::move(snap));
-    return true;
-}
-
-void PaintEngine::restoreSnapshot(const Texture& snap) {
-    // Render the snapshot back into the paint FBO using a passthrough draw.
-    // We don't have a stand-alone passthrough shader here — reuse the pen
-    // shader with hardness=1, colour=white, but actually the cleanest is to
-    // glBlitFramebuffer between the snapshot's owning FBO and ours. Here we
-    // just clear and re-blit via glCopyTexSubImage2D in reverse: bind the
-    // paint FBO, glReadPixels from snap into a temp, glTexSubImage2D upload.
-    // Simpler path — use a quick passthrough draw via the marker shader at
-    // a=1, hardness=1, with the snapshot bound as colour mask. For brevity
-    // we ship the path via a copy-quad: paintFbo_ ← snap.
-    paintFbo_.bind();
+void PaintEngine::restoreSnapshot(Framebuffer& target, const Texture& snap) {
+    // Render the snapshot back into `target` using a one-shot passthrough
+    // shader. Earlier iterations tried glCopyTexSubImage2D and a re-purposed
+    // pen-shader stamp; the cleanest path that survived was a tiny dedicated
+    // blit program kept as a static so it compiles once per process.
+    target.bind();
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT);
-    // Use pen shader as a "draw textured rect" — bind snap to TEX0, paint a
-    // full-screen quad. We don't have a textured passthrough shader here, so
-    // we approximate by drawing a single big stamp colored by the snap's
-    // sample. To keep the implementation small we go the official-but-rare
-    // path: a one-off shader.
-    // ----- one-shot blit -----
     static constexpr const char* kBlitVs = R"(#version 300 es
         layout(location = 0) in vec2 a_pos;
         out vec2 v_uv;
@@ -415,36 +428,63 @@ void PaintEngine::restoreSnapshot(const Texture& snap) {
     Framebuffer::bindDefault();
 }
 
-void PaintEngine::undo() {
-    if (undoableSnapshots_.size() < 2) {
-        // Single snapshot = the just-finished stroke; popping it would leave
-        // nothing to restore. We need at least two snapshots: the previous
-        // state (target) + the current state (push to redo).
-        if (undoableSnapshots_.size() == 1) {
-            pushRedoSnapshot();
-            undoableSnapshots_.pop_back();
-            // Clear the layer back to empty.
-            paintFbo_.bind();
-            glClearColor(0, 0, 0, 0);
-            glClear(GL_COLOR_BUFFER_BIT);
-            Framebuffer::bindDefault();
-        }
+namespace {
+// Shared body for undoLayer / redoLayer. `current` is the FBO to roll back,
+// `undoStack` holds the history of past states (top = current), `redoStack`
+// gets the popped state pushed to it so redoLayer can put it back.
+void undoLayerImpl(Framebuffer& current,
+                   std::vector<std::unique_ptr<Texture>>& undoStack,
+                   std::vector<std::unique_ptr<Texture>>& redoStack,
+                   PaintEngine& self) {
+    if (undoStack.empty()) return;
+    if (undoStack.size() == 1) {
+        // Only one snapshot = the just-finished stroke. Move it to redo so
+        // the user can come back, then clear the layer.
+        redoStack.push_back(std::move(undoStack.back()));
+        undoStack.pop_back();
+        current.bind();
+        glClearColor(0, 0, 0, 0);
+        glClear(GL_COLOR_BUFFER_BIT);
+        Framebuffer::bindDefault();
         return;
     }
-    pushRedoSnapshot();
-    undoableSnapshots_.pop_back();
-    restoreSnapshot(*undoableSnapshots_.back());
+    // ≥ 2 snapshots: move the topmost (current state) to redo, then restore
+    // the now-top (= state before the popped stroke) into the live FBO.
+    redoStack.push_back(std::move(undoStack.back()));
+    undoStack.pop_back();
+    self.restoreSnapshot(current, *undoStack.back());
 }
 
-void PaintEngine::redo() {
-    if (redoableSnapshots_.empty()) return;
-    auto next = std::move(redoableSnapshots_.back());
-    redoableSnapshots_.pop_back();
-    restoreSnapshot(*next);
-    if (undoableSnapshots_.size() >= kMaxSnapshots) {
-        undoableSnapshots_.erase(undoableSnapshots_.begin());
-    }
-    undoableSnapshots_.push_back(std::move(next));
+void redoLayerImpl(Framebuffer& current,
+                   std::vector<std::unique_ptr<Texture>>& undoStack,
+                   std::vector<std::unique_ptr<Texture>>& redoStack,
+                   size_t cap,
+                   PaintEngine& self) {
+    if (redoStack.empty()) return;
+    auto next = std::move(redoStack.back());
+    redoStack.pop_back();
+    self.restoreSnapshot(current, *next);
+    if (undoStack.size() >= cap) undoStack.erase(undoStack.begin());
+    undoStack.push_back(std::move(next));
+}
+} // namespace
+
+void PaintEngine::undoPaintLayer() {
+    undoLayerImpl(paintFbo_, undoableSnapshots_, redoableSnapshots_, *this);
+}
+
+void PaintEngine::redoPaintLayer() {
+    redoLayerImpl(paintFbo_, undoableSnapshots_, redoableSnapshots_,
+                  kMaxSnapshots, *this);
+}
+
+void PaintEngine::undoBlurLayer() {
+    undoLayerImpl(blurMaskFbo_, undoableBlurSnapshots_, redoableBlurSnapshots_, *this);
+}
+
+void PaintEngine::redoBlurLayer() {
+    redoLayerImpl(blurMaskFbo_, undoableBlurSnapshots_, redoableBlurSnapshots_,
+                  kMaxSnapshots, *this);
 }
 
 void PaintEngine::clear() {
@@ -452,9 +492,14 @@ void PaintEngine::clear() {
     paintFbo_.bind();
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT);
+    blurMaskFbo_.bind();
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
     Framebuffer::bindDefault();
     undoableSnapshots_.clear();
     redoableSnapshots_.clear();
+    undoableBlurSnapshots_.clear();
+    redoableBlurSnapshots_.clear();
 }
 
 } // namespace photoedit

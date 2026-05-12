@@ -171,16 +171,29 @@ class NativePhotoEditor : AutoCloseable {
         onGl { nativeEndStroke(handle) }
     }
 
-    /** Roll back to the previous stroke commit. No-op if there's nothing to undo. */
+    /** Roll back the most recent paint stroke (Pen / Marker / Neon / Arrow / Eraser).
+     *  Blur-brush strokes live on their own stack — see [undoBlur]. */
     fun undoPaint() {
         if (handle == 0L) return
         onGl { nativeUndoPaint(handle) }
     }
 
-    /** Re-apply the most recently undone stroke. No-op if a new stroke has been started since. */
+    /** Re-apply the most recently undone paint stroke. No-op if a new stroke has been started since. */
     fun redoPaint() {
         if (handle == 0L) return
         onGl { nativeRedoPaint(handle) }
+    }
+
+    /** Roll back the most recent blur-brush stroke. Independent of paint undo so the user
+     *  can erase a blur smudge without losing their paint marks. */
+    fun undoBlur() {
+        if (handle == 0L) return
+        onGl { nativeUndoBlur(handle) }
+    }
+
+    fun redoBlur() {
+        if (handle == 0L) return
+        onGl { nativeRedoBlur(handle) }
     }
 
     /** Wipe the entire paint layer + history. Cannot be undone. */
@@ -257,6 +270,8 @@ class NativePhotoEditor : AutoCloseable {
     private external fun nativeEndStroke(handle: Long)
     private external fun nativeUndoPaint(handle: Long)
     private external fun nativeRedoPaint(handle: Long)
+    private external fun nativeUndoBlur(handle: Long)
+    private external fun nativeRedoBlur(handle: Long)
     private external fun nativeClearPaint(handle: Long)
     private external fun nativeUpsertTextItem(
         handle: Long, id: Int, bitmap: Bitmap,

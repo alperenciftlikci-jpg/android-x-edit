@@ -105,7 +105,7 @@ private const val THUMB_HEIGHT = 54
 // The C++ path requires libvideoedit.so on the target ABI (armeabi-v7a + x86_64 only
 // today). On arm64 it'll throw UnsatisfiedLinkError; we catch that and fall back.
 private enum class TrimImpl { JAVA_MP4BUILDER, CPP_FFMPEG }
-private val TRIM_IMPL: TrimImpl = TrimImpl.CPP_FFMPEG
+private val TRIM_IMPL: TrimImpl = TrimImpl.JAVA_MP4BUILDER
 
 /**
  * Telegram-style video trimmer — MMR for thumbnails, stream-copy for export.
@@ -561,15 +561,33 @@ private suspend fun preCopyContentToCache(
     val cacheFile = File(context.cacheDir, "videoedit-source-${System.currentTimeMillis()}")
     try {
         val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: return@withContext null
-        pfd.use { fd ->
-            val srcLen = if (fd.statSize > 0) fd.statSize else Long.MAX_VALUE
+        val expectedLen = pfd.use { fd ->
+            val srcLen = fd.statSize.takeIf { it > 0 } ?: -1L
             FileInputStream(fd.fileDescriptor).use { fis ->
                 FileOutputStream(cacheFile).use { fos ->
-                    fis.channel.transferTo(0, srcLen, fos.channel)
+                    // transferTo() can return less than requested per call (per JDK
+                    // contract). Loop until everything is transferred — otherwise
+                    // a partial source slips through and trim produces garbage.
+                    val target = if (srcLen > 0) srcLen else Long.MAX_VALUE
+                    var pos = 0L
+                    while (pos < target) {
+                        val n = fis.channel.transferTo(pos, target - pos, fos.channel)
+                        if (n <= 0L) break
+                        pos += n
+                    }
+                    pos
                 }
             }
+            srcLen
         }
-        if (cacheFile.length() > 0) cacheFile else null.also { cacheFile.delete() }
+        val copied = cacheFile.length()
+        if (copied > 0 && (expectedLen <= 0 || copied == expectedLen)) {
+            cacheFile
+        } else {
+            Timber.w("preCopyContentToCache: incomplete copy (got %d, expected %d)", copied, expectedLen)
+            cacheFile.delete()
+            null
+        }
     } catch (t: Throwable) {
         Timber.w(t, "preCopyContentToCache failed for %s", uri)
         runCatching { cacheFile.delete() }
@@ -624,21 +642,21 @@ private suspend fun runMp4BuilderTrim(
         else -> sourceUri.path ?: return@withContext VideoApplyOutcome.Error("Bad source path.")
     }
 
-    // Read source video dimensions for the Mp4Movie size header. The engine itself
-    // doesn't strictly need this, but writing 0×0 there confuses some downstream
-    // players. Cheap MMR call.
-    val (width, height) = try {
+    // MediaMuxer needs an explicit setOrientationHint — it doesn't pull rotation
+    // from the source track format. Cheap MMR call to read it.
+    val (width, height, rotation) = try {
         val mmr = MediaMetadataRetriever()
         mmr.setDataSource(inputPath)
         val w = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
         val h = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+        val r = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
         mmr.release()
-        w to h
+        Triple(w, h, r)
     } catch (_: Throwable) {
-        0 to 0
+        Triple(0, 0, 0)
     }
-    Timber.d("runMp4BuilderTrim: input=%s %dx%d trim=[%d,%d]ms local=%s",
-        inputPath, width, height, trimStartMs, trimEndMs, usingLocalCopy)
+    Timber.d("runMp4BuilderTrim: input=%s %dx%d rot=%d trim=[%d,%d]ms local=%s",
+        inputPath, width, height, rotation, trimStartMs, trimEndMs, usingLocalCopy)
 
     // Throttle progress callback — Compose recomposition is expensive.
     var lastProgressMs = 0L
@@ -697,8 +715,7 @@ private suspend fun runMp4BuilderTrim(
             trimStartMs * 1000L,
             trimEndMs * 1000L,
             true,
-            width.coerceAtLeast(2),
-            height.coerceAtLeast(2),
+            rotation,
             cb,
         )
         val elapsed = SystemClock.elapsedRealtime() - wallStart

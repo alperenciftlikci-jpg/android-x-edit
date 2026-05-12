@@ -50,9 +50,23 @@ public final class Mp4TrimEngine {
     private Mp4TrimEngine() {}
 
     /**
-     * Convenience entry point — opens the source, sets up Mp4Movie/MP4Builder via the
-     * Muxer wrapper, runs readAndWriteTracks, and finishMovies. Mirrors the mux-only
-     * else-branch of MediaCodecVideoConvertor#convertVideoInternal.
+     * Convenience entry point — opens the source, sets up Android's native MediaMuxer
+     * via the same Muxer wrapper Telegram uses (we just pick the native branch instead
+     * of MP4Builder), runs readAndWriteTracks, and stops the muxer.
+     *
+     * Why MediaMuxer instead of MP4Builder:
+     *   - MediaMuxer's moov box is built in C++ (libstagefright). MP4Builder's is built
+     *     by pure-Java mp4parser through reflection — for a ~4400-sample export the
+     *     finalize step alone was several seconds.
+     *   - MediaMuxer doesn't fsync on every chunk. MP4Builder defaulted to fsync per
+     *     32 KB, which on emulators added ~25 s per export. (We had already flipped
+     *     that off via setAllowSyncFiles(false), but the native path is still faster.)
+     *
+     * @param rotation orientation hint in degrees (0/90/180/270). For a stream-copy we
+     *                 don't get rotation from the source's track format — MediaMuxer
+     *                 ignores any rotation embedded there and only honours
+     *                 setOrientationHint(). Caller should pass the value from
+     *                 MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION.
      */
     public static Result trim(
             String inputPath,
@@ -60,8 +74,7 @@ public final class Mp4TrimEngine {
             long startUs,
             long endUs,
             boolean needAudio,
-            int resultWidth,
-            int resultHeight,
+            int rotation,
             ProgressCallback callback
     ) {
         MediaExtractor extractor = new MediaExtractor();
@@ -69,12 +82,13 @@ public final class Mp4TrimEngine {
         try {
             extractor.setDataSource(inputPath);
 
-            Mp4Movie movie = new Mp4Movie();
-            movie.setCacheFile(outputFile);
-            movie.setRotation(0);
-            movie.setSize(resultWidth, resultHeight);
-            MP4Builder builder = new MP4Builder().createMovie(movie, false, false);
-            mediaMuxer = new Muxer(builder);
+            MediaMuxer rawMuxer = new MediaMuxer(
+                    outputFile.getAbsolutePath(),
+                    MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+            if (rotation != 0) {
+                rawMuxer.setOrientationHint(rotation);
+            }
+            mediaMuxer = new Muxer(rawMuxer);
 
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
             long duration = endUs > startUs ? (endUs - startUs) : 0;
@@ -149,7 +163,13 @@ public final class Mp4TrimEngine {
                     started = true;
                 }
                 mediaMuxer.writeSampleData(trackIndex, byteBuf, bufferInfo);
-                return 0;
+                // Return bufferInfo.size (non-zero) so the readAndWriteTracks
+                // progress callback fires. The MP4Builder branch returns the
+                // current file position when 32KB is reached; for MediaMuxer
+                // we don't have a cheap equivalent — but the caller only uses
+                // this value to decide whether to fire `didWriteData`, and the
+                // Kotlin layer throttles progress anyway.
+                return bufferInfo.size;
             } else if (mp4Builder != null) {
                 return mp4Builder.writeSampleData(trackIndex, byteBuf, bufferInfo, writeLength);
             }
@@ -175,7 +195,12 @@ public final class Mp4TrimEngine {
 
         public void finishMovie() throws Exception {
             if (mediaMuxer != null) {
-                mediaMuxer.stop();
+                // Only stop() if we actually started — stop() throws
+                // IllegalStateException otherwise (zero-sample trim is rare
+                // but defensive).
+                if (started) {
+                    mediaMuxer.stop();
+                }
                 mediaMuxer.release();
             } else if (mp4Builder != null) {
                 mp4Builder.finishMovie();
@@ -257,8 +282,31 @@ public final class Mp4TrimEngine {
         // the rewrite or the decoder rejects everything past the IDR keyframe.
         // Switching to heap activates Telegram's own rewrite code unchanged.
         ByteBuffer buffer = ByteBuffer.allocate(maxBufferSize);
+        // Decide once whether the source returns Annex-B (00 00 00 01 start codes)
+        // or AVCC (length-prefixed) video samples. MediaExtractor's choice is
+        // consistent per stream, so a single peek at the first video sample tells
+        // us whether to keep running the rewrite loop. On AVCC sources skipping
+        // the loop saves a full pass over every video byte (~500–700 ms for a
+        // typical 4 k-frame trim).
+        boolean videoFormatChecked = false;
+        boolean needsAnnexbRewrite = false;
         if (audioTrackIndex >= 0 || videoTrackIndex >= 0) {
             long startTime = -1;
+            // SECOND DIVERGENCE from Telegram: per-track PTS rebasing.
+            // When trimming with start > 0, MediaExtractor seeks to the previous sync
+            // frame and returns samples with their ORIGINAL absolute PTS (e.g. 207s).
+            // Telegram's Track.prepare() then computes CTTS composition offsets as
+            // `presentationTime - decodeTime`, which yields ~start (huge) for every
+            // frame — players try to display the first frame at +207s on a 138s
+            // track and freeze. Telegram tracks `startTime` here but never applies
+            // it (it's used only for the progress callback). For Telegram this rarely
+            // bites because their typical trim is from time 0. We rebase per-track:
+            // first sample becomes PTS 0 on its track, subsequent samples relative
+            // to that. This keeps each track internally consistent and preserves A/V
+            // sync as long as audio and video keyframes are roughly aligned (which
+            // they are after SEEK_TO_PREVIOUS_SYNC).
+            long videoPtsOffsetUs = -1;
+            long audioPtsOffsetUs = -1;
             while (!inputDone) {
                 boolean eof = false;
                 int muxerTrackIndex;
@@ -285,23 +333,39 @@ public final class Mp4TrimEngine {
                         buffer.position(0);
                         buffer.limit(info.size);
                     }
-                    if (index != audioTrackIndex) {
+                    if (index == videoTrackIndex) {
                         byte[] array = buffer.array();
                         if (array != null) {
                             int offset = buffer.arrayOffset();
-                            int len = offset + buffer.limit();
-                            int writeStart = -1;
-                            for (int a = offset; a <= len - 4; a++) {
-                                if (array[a] == 0 && array[a + 1] == 0 && array[a + 2] == 0 && array[a + 3] == 1 || a == len - 4) {
-                                    if (writeStart != -1) {
-                                        int l = a - writeStart - (a != len - 4 ? 4 : 0);
-                                        array[writeStart] = (byte) (l >> 24);
-                                        array[writeStart + 1] = (byte) (l >> 16);
-                                        array[writeStart + 2] = (byte) (l >> 8);
-                                        array[writeStart + 3] = (byte) l;
-                                        writeStart = a;
-                                    } else {
-                                        writeStart = a;
+                            // First video sample dictates whether the stream is
+                            // Annex-B. Peek at the leading 4 bytes once and stash
+                            // the answer for the rest of the run.
+                            if (!videoFormatChecked && info.size >= 4) {
+                                needsAnnexbRewrite =
+                                        array[offset] == 0 && array[offset + 1] == 0
+                                        && array[offset + 2] == 0 && array[offset + 3] == 1;
+                                videoFormatChecked = true;
+                                if (needsAnnexbRewrite) {
+                                    Log.d(TAG, "source is Annex-B → running NAL rewrite");
+                                } else {
+                                    Log.d(TAG, "source is AVCC → skipping NAL rewrite");
+                                }
+                            }
+                            if (needsAnnexbRewrite) {
+                                int len = offset + buffer.limit();
+                                int writeStart = -1;
+                                for (int a = offset; a <= len - 4; a++) {
+                                    if (array[a] == 0 && array[a + 1] == 0 && array[a + 2] == 0 && array[a + 3] == 1 || a == len - 4) {
+                                        if (writeStart != -1) {
+                                            int l = a - writeStart - (a != len - 4 ? 4 : 0);
+                                            array[writeStart] = (byte) (l >> 24);
+                                            array[writeStart + 1] = (byte) (l >> 16);
+                                            array[writeStart + 2] = (byte) (l >> 8);
+                                            array[writeStart + 3] = (byte) l;
+                                            writeStart = a;
+                                        } else {
+                                            writeStart = a;
+                                        }
                                     }
                                 }
                             }
@@ -318,14 +382,35 @@ public final class Mp4TrimEngine {
                         if (index == videoTrackIndex && start > 0 && startTime == -1) {
                             startTime = info.presentationTimeUs;
                         }
+                        // The `end` check uses the ORIGINAL absolute PTS, before
+                        // rebasing — we want to trim by the source's own timeline.
                         if (end < 0 || info.presentationTimeUs < end) {
+                            // Rebase: subtract this track's first sample PTS so the
+                            // first frame ends up at PTS 0 on the output.
+                            if (index == videoTrackIndex) {
+                                if (videoPtsOffsetUs < 0) {
+                                    videoPtsOffsetUs = info.presentationTimeUs;
+                                }
+                                info.presentationTimeUs -= videoPtsOffsetUs;
+                            } else if (index == audioTrackIndex) {
+                                if (audioPtsOffsetUs < 0) {
+                                    audioPtsOffsetUs = info.presentationTimeUs;
+                                }
+                                info.presentationTimeUs -= audioPtsOffsetUs;
+                            }
+                            if (info.presentationTimeUs < 0) {
+                                info.presentationTimeUs = 0;
+                            }
                             info.offset = 0;
                             info.flags = extractor.getSampleFlags();
                             long availableSize = mediaMuxer.writeSampleData(muxerTrackIndex, buffer, info, false);
                             if (availableSize != 0) {
                                 if (callback != null) {
-                                    if (info.presentationTimeUs - startTime > currentPts) {
-                                        currentPts = info.presentationTimeUs - startTime;
+                                    // Telegram's original line was `info.presentationTimeUs - startTime`
+                                    // using absolute PTS. We rebased above, so info.presentationTimeUs
+                                    // is already relative to the track start — use it directly.
+                                    if (info.presentationTimeUs > currentPts) {
+                                        currentPts = info.presentationTimeUs;
                                     }
                                     callback.didWriteData(availableSize, (currentPts / 1000f) / durationS);
                                 }
