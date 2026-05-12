@@ -15,6 +15,7 @@ extern "C" {
 #include "../core/Logger.h"
 #include "../decoder/VideoDecoder.h"
 #include "../pipeline/VideoEditor.h"
+#include "../pipeline/StreamCopyTrim.h"
 
 #include <android/bitmap.h>
 #include <string>
@@ -219,6 +220,82 @@ Java_io_element_android_libraries_videoeditor_native_1_NativeVideoEditor_nativeP
     env->ReleaseStringUTFChars(jInput,  inputPath);
     env->ReleaseStringUTFChars(jOutput, outputPath);
     return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+// ---------------------------------------------------------------------------
+// FFmpeg stream-copy trim (`ffmpeg -ss A -to B -i in -c copy out` equivalent).
+// Returns a long[8]:
+//   [0]  success (1/0)
+//   [1]  bytesWritten
+//   [2]  packetsWritten
+//   [3]  firstPtsUs
+//   [4]  lastPtsUs
+//   [5..7] reserved
+// Error message (if any) is available via nativeStreamCopyTrimLastError().
+// ---------------------------------------------------------------------------
+
+namespace {
+// Last error message from streamCopyTrim — stashed across the JNI boundary so we
+// don't need to allocate a Java String inside the worker.
+std::string g_lastStreamCopyError;
+} // namespace
+
+JNIEXPORT jlongArray JNICALL
+Java_io_element_android_libraries_videoeditor_native_1_NativeStreamCopyTrim_nativeStreamCopyTrim(
+        JNIEnv* env, jobject /*thiz*/,
+        jstring jInput, jstring jOutput,
+        jlong startUs, jlong endUs,
+        jobject listener) {
+    g_lastStreamCopyError.clear();
+    if (!jInput || !jOutput) {
+        g_lastStreamCopyError = "null input/output path";
+        jlongArray ret = env->NewLongArray(8);
+        return ret;
+    }
+    const char* inputPath  = env->GetStringUTFChars(jInput,  nullptr);
+    const char* outputPath = env->GetStringUTFChars(jOutput, nullptr);
+
+    // Progress callback bridge: invoke the Java listener's onProgress(float).
+    struct ProgressBridge {
+        JNIEnv*   env;
+        jobject   listener;
+        jmethodID method;
+    } bridge{env, listener, nullptr};
+    if (listener) {
+        jclass cls = env->GetObjectClass(listener);
+        bridge.method = env->GetMethodID(cls, "onProgress", "(F)V");
+    }
+    videoedit::TrimProgressCallback cb;
+    if (listener && bridge.method) {
+        cb = [&bridge](float f) {
+            bridge.env->CallVoidMethod(bridge.listener, bridge.method, (jfloat)f);
+        };
+    }
+
+    videoedit::StreamCopyTrimResult r = videoedit::streamCopyTrim(
+            inputPath, outputPath, (int64_t)startUs, (int64_t)endUs, cb);
+    if (!r.success) g_lastStreamCopyError = r.error;
+
+    env->ReleaseStringUTFChars(jInput,  inputPath);
+    env->ReleaseStringUTFChars(jOutput, outputPath);
+
+    jlongArray arr = env->NewLongArray(8);
+    jlong values[8] = {
+            r.success ? 1L : 0L,
+            (jlong)r.bytesWritten,
+            (jlong)r.packetsWritten,
+            (jlong)r.firstPtsUs,
+            (jlong)r.lastPtsUs,
+            0, 0, 0,
+    };
+    env->SetLongArrayRegion(arr, 0, 8, values);
+    return arr;
+}
+
+JNIEXPORT jstring JNICALL
+Java_io_element_android_libraries_videoeditor_native_1_NativeStreamCopyTrim_nativeStreamCopyTrimLastError(
+        JNIEnv* env, jobject /*thiz*/) {
+    return env->NewStringUTF(g_lastStreamCopyError.c_str());
 }
 
 } // extern "C"

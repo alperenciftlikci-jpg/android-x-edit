@@ -72,6 +72,7 @@ set(SRC_ENCODER
 set(SRC_PIPELINE
     pipeline/VideoEditor.cpp
     pipeline/SimpleFilters.cpp
+    pipeline/StreamCopyTrim.cpp
 )
 
 set(SRC_JNI

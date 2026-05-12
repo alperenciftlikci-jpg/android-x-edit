@@ -10,10 +10,16 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
+
+/** Visual frame variants matching the Compose-side `TextFrameType`. Kept here as well so the
+ *  rendering pipeline can bake the frame straight into the text bitmap at export time —
+ *  without this, the editor preview (Compose-drawn frame) and the JPEG (no frame) drift. */
+enum class TextFrame { Plain, Solid, Semi, Outline }
 
 /**
  * Render a string into an RGBA_8888 bitmap suitable for [NativePhotoEditor.upsertTextItem].
@@ -40,15 +46,37 @@ object TextRenderer {
         bold: Boolean = true,
         maxWidthPx: Int = Int.MAX_VALUE,
         padding: Int = 16,
-        backgroundColorArgb: Int = Color.TRANSPARENT,
+        frame: TextFrame = TextFrame.Plain,
     ): Bitmap {
+        // Frame colours follow the same rule as the Compose-side TextEntityBody:
+        //   Solid:    bg = swatch,        text = white/black chosen by swatch brightness
+        //   Semi:     bg = swatch @ 60 %, text = white/black chosen by swatch brightness
+        //   Outline:  bg = transparent,   text = swatch, frame stroke = swatch
+        //   Plain:    bg = transparent,   text = swatch
+        val swatchR = ((colorArgb shr 16) and 0xFF) / 255f
+        val swatchG = ((colorArgb shr 8) and 0xFF) / 255f
+        val swatchB = (colorArgb and 0xFF) / 255f
+        val brightness = swatchR * 0.299f + swatchG * 0.587f + swatchB * 0.114f
+        val (bgColor, textColor) = when (frame) {
+            TextFrame.Solid -> {
+                val bg = colorArgb or 0xFF000000.toInt() // force opaque
+                val tx = if (brightness >= 0.721f) Color.BLACK else Color.WHITE
+                bg to tx
+            }
+            TextFrame.Semi -> {
+                val bg = (colorArgb and 0x00FFFFFF) or 0x99000000.toInt() // ~60% alpha
+                val tx = if (brightness >= 0.5f) Color.BLACK else Color.WHITE
+                bg to tx
+            }
+            TextFrame.Outline, TextFrame.Plain -> Color.TRANSPARENT to colorArgb
+        }
+
         val paint = TextPaint().apply {
             isAntiAlias = true
-            color = colorArgb
+            color = textColor
             textSize = fontSizePx
             typeface = if (bold) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
         }
-        // Measure first to size the bitmap.
         val safeWidth = if (maxWidthPx == Int.MAX_VALUE) {
             paint.measureText(text).toInt().coerceAtLeast(1)
         } else {
@@ -60,26 +88,58 @@ object TextRenderer {
             .setIncludePad(false)
             .build()
 
-        // Tighten the bitmap width to the actual maximum line width so we don't
-        // waste pixels (and so transform pivot stays at the centre of the glyphs).
         var maxLineW = 0f
         for (i in 0 until layout.lineCount) {
             val w = layout.getLineWidth(i)
             if (w > maxLineW) maxLineW = w
         }
-        val bw = (maxLineW.toInt() + padding * 2).coerceAtLeast(1)
-        val bh = (layout.height + padding * 2).coerceAtLeast(1)
+
+        // Extra padding for filled / outline frames so the box has visible margin around
+        // the glyphs — matches the Compose-side `padding(horizontal = 10.dp, vertical = 4.dp)`
+        // converted to fontSize-relative pixels (~20% horizontal, ~10% vertical of glyph).
+        val framePadX = if (frame == TextFrame.Plain) 0 else (fontSizePx * 0.20f).toInt()
+        val framePadY = if (frame == TextFrame.Plain) 0 else (fontSizePx * 0.10f).toInt()
+        val totalPadX = padding + framePadX
+        val totalPadY = padding + framePadY
+
+        val bw = (maxLineW.toInt() + totalPadX * 2).coerceAtLeast(1)
+        val bh = (layout.height + totalPadY * 2).coerceAtLeast(1)
 
         val bitmap = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
-        if (backgroundColorArgb != Color.TRANSPARENT) {
-            canvas.drawColor(backgroundColorArgb)
+
+        // 1) Draw frame backdrop (only for Solid / Semi / Outline).
+        if (frame == TextFrame.Solid || frame == TextFrame.Semi) {
+            val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = bgColor }
+            val cornerRadius = fontSizePx * 0.12f
+            val rect = RectF(
+                padding.toFloat(),
+                padding.toFloat(),
+                (bw - padding).toFloat(),
+                (bh - padding).toFloat(),
+            )
+            canvas.drawRoundRect(rect, cornerRadius, cornerRadius, bgPaint)
+        } else if (frame == TextFrame.Outline) {
+            val strokeWidth = fontSizePx * 0.04f
+            val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = colorArgb
+                style = Paint.Style.STROKE
+                this.strokeWidth = strokeWidth
+            }
+            val cornerRadius = fontSizePx * 0.12f
+            val inset = strokeWidth / 2f
+            val rect = RectF(
+                padding.toFloat() + inset,
+                padding.toFloat() + inset,
+                (bw - padding).toFloat() - inset,
+                (bh - padding).toFloat() - inset,
+            )
+            canvas.drawRoundRect(rect, cornerRadius, cornerRadius, borderPaint)
         }
+
+        // 2) Draw the glyphs.
         canvas.save()
-        canvas.translate(padding.toFloat(), padding.toFloat())
-        // Note: StaticLayout draws into a non-premultiplied surface by default — Bitmap is
-        // ARGB_8888 with premultiplied alpha when created via Bitmap.createBitmap, so the result
-        // is already premultiplied, matching what the native composite expects.
+        canvas.translate(totalPadX.toFloat(), totalPadY.toFloat())
         layout.draw(canvas)
         canvas.restore()
         return bitmap

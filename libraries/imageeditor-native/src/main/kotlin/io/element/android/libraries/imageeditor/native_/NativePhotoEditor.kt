@@ -113,6 +113,32 @@ class NativePhotoEditor : AutoCloseable {
         onGl { nativeSetCropParams(handle, params.toFloatArray()) }
     }
 
+    /** One-shot render path. Atomically updates filter + crop params, then exports into the
+     *  destination bitmap, all on the dedicated GL thread. Previously the preview loop
+     *  invoked four separate `onGl` blocks (setFilterParams / setCropParams /
+     *  croppedOutputSize / exportTo), each round-tripping through `submit()/get()` and
+     *  contributing its own queue overhead. Folding the sequence cuts queue churn by 4×
+     *  and keeps the state mutation + render atomic, so a tab switch can never observe
+     *  a half-applied state. */
+    fun renderPreviewInto(
+        dst: Bitmap,
+        filterParams: FilterParams,
+        cropParams: CropParams,
+    ): Boolean {
+        if (handle == 0L) return false
+        if (dst.config != Bitmap.Config.ARGB_8888 || !dst.isMutable) return false
+        return onGl {
+            nativeSetFilterParams(
+                handle,
+                filterParams.toFloatArray(),
+                filterParams.curves.data,
+                filterParams.curves.isIdentity,
+            )
+            nativeSetCropParams(handle, cropParams.toFloatArray())
+            nativeExportToBitmap(handle, dst)
+        }
+    }
+
     /**
      * Returns `(width, height)` of the bitmap that would result from running the current
      * pipeline (filters + crop). Use this to allocate the destination bitmap before

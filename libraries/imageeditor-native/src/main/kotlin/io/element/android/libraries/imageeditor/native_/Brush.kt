@@ -26,8 +26,10 @@ data class Brush(
     val a: Float = 1f,
     /** Stamp radius in *destination pixel space* — i.e. paint-layer pixels, not dp. */
     val radiusPx: Float = 8f,
-    /** Edge falloff for [BrushType.Pen] / [BrushType.Eraser]. 1.0 = sharp edge, 0.0 = soft. */
-    val hardness: Float = 0.6f,
+    /** Edge falloff for [BrushType.Pen] / [BrushType.Eraser]. 1.0 = sharp edge, 0.0 = soft.
+     *  Default kept high so a baked native pen stroke matches the Compose live-overlay
+     *  Path drawing (anti-aliased solid line, virtually no fade). Lower it for soft brushes. */
+    val hardness: Float = 0.92f,
 ) {
     /** Layout matches `nativeBeginStroke`'s float[8] in photoedit-jni.cpp. */
     fun toFloatArray(): FloatArray = floatArrayOf(

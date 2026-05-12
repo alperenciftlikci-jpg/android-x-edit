@@ -17,25 +17,28 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import kotlin.math.abs
 
 /**
- * Telegram-style trim selector — two yellow handles at the start/end of the selected range,
- * with a translucent overlay over the unselected regions. Designed to be stacked on top of
- * a [TelegramTimelineThumbnails] strip via a parent Box.
+ * Telegram-style trim selector — yellow handles centred on the trim boundary, dim black
+ * overlay on the unselected regions, white draggable play-head inside the selection.
  *
- * `startFraction` / `endFraction` are normalised positions in `[0, 1]` along the strip.
- * Drag a handle to move that endpoint; the parent receives only commit-on-end via
- * `onTrimChange` (called continuously during drag for live preview).
+ * Hit zones (density-aware, so the same physical mm on every screen):
+ *  - 36 dp slop around each handle → grabs Start / End
+ *  - 24 dp slop around the play-head → scrubs playback
+ *  - Anywhere else inside the selection → starts a scrub (play-head jumps to touch)
  *
- * Hit-testing: 24 dp slop around each handle; if the user grabs the middle of the selection
- * the whole range pans (start + end shift together, clamped to `[0, 1]`).
+ * Visual mirrors `org.telegram.ui.Components.VideoTimelinePlayView`: 0xFFFFFF00 yellow,
+ * chunky 16 dp handles with 4 dp corner rounding, two parallel dark grip bars per handle,
+ * 0x99 black dim over the unselected segments, bold white play-head pill.
  */
 @Composable
 fun TelegramTrimHandles(
@@ -43,7 +46,9 @@ fun TelegramTrimHandles(
     endFraction: Float,
     onTrimChange: (start: Float, end: Float) -> Unit,
     modifier: Modifier = Modifier,
-    accentColor: Color = Color(0xFFE5BB3B),    // Telegram yellow
+    playProgress: Float? = null,
+    onPlayProgressChange: ((Float) -> Unit)? = null,
+    accentColor: Color = Color(0xFFFFFF00),
     minSelectionFraction: Float = 0.02f,
 ) {
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
@@ -51,22 +56,42 @@ fun TelegramTrimHandles(
 
     val startState by rememberUpdatedState(startFraction)
     val endState   by rememberUpdatedState(endFraction)
+    val playState  by rememberUpdatedState(playProgress)
+    val onScrubState by rememberUpdatedState(onPlayProgressChange)
 
     Box(
         modifier = modifier
             .fillMaxSize()
+            .onSizeChanged { canvasSize = it }
             .pointerInput(Unit) {
+                // Density-aware tolerances — chunky physical targets, ≈12 mm on handles
+                // and ≈8 mm on the play-head at 3x density.
+                val handleTolerancePx = 36.dp.toPx()
+                val playTolerancePx = 24.dp.toPx()
                 detectDragGestures(
                     onDragStart = { startOffset ->
                         val w = canvasSize.width.coerceAtLeast(1).toFloat()
                         val touchX = startOffset.x
                         val startPx = startState * w
                         val endPx   = endState * w
-                        val tolPx = 32f
+                        val playPx  = playState?.let { it * w }
+                        val canScrub = onScrubState != null
+
+                        // Priority: trim handles first (sit at the edges of the selection),
+                        // then play-head, then anywhere inside selection as a scrub.
                         dragMode = when {
-                            abs(touchX - startPx) < tolPx -> DragMode.Start
-                            abs(touchX - endPx) < tolPx   -> DragMode.End
-                            touchX > startPx && touchX < endPx -> DragMode.Pan
+                            abs(touchX - startPx) < handleTolerancePx -> DragMode.Start
+                            abs(touchX - endPx) < handleTolerancePx   -> DragMode.End
+                            canScrub && playPx != null &&
+                                abs(touchX - playPx) < playTolerancePx -> DragMode.PlayHead
+                            canScrub && touchX > startPx && touchX < endPx -> {
+                                // Touch anywhere inside the selection ⇒ play-head jumps to
+                                // that spot, then subsequent drag deltas refine. This is
+                                // how Telegram's video editor lets you scrub instantly.
+                                val targetFrac = (touchX / w).coerceIn(startState, endState)
+                                onScrubState?.invoke(targetFrac)
+                                DragMode.PlayHead
+                            }
                             else -> DragMode.None
                         }
                     },
@@ -78,20 +103,20 @@ fun TelegramTrimHandles(
                     val deltaFrac = dragDelta.x / w
                     when (dragMode) {
                         DragMode.Start -> {
-                            val newStart = (startState + deltaFrac).coerceIn(
-                                0f, endState - minSelectionFraction)
+                            val newStart = (startState + deltaFrac)
+                                .coerceIn(0f, endState - minSelectionFraction)
                             onTrimChange(newStart, endState)
                         }
                         DragMode.End -> {
-                            val newEnd = (endState + deltaFrac).coerceIn(
-                                startState + minSelectionFraction, 1f)
+                            val newEnd = (endState + deltaFrac)
+                                .coerceIn(startState + minSelectionFraction, 1f)
                             onTrimChange(startState, newEnd)
                         }
-                        DragMode.Pan -> {
-                            val span = endState - startState
-                            val rawStart = startState + deltaFrac
-                            val newStart = rawStart.coerceIn(0f, 1f - span)
-                            onTrimChange(newStart, newStart + span)
+                        DragMode.PlayHead -> {
+                            val current = playState ?: ((startState + endState) / 2f)
+                            val newProgress = (current + deltaFrac)
+                                .coerceIn(startState, endState)
+                            onScrubState?.invoke(newProgress)
                         }
                         DragMode.None -> Unit
                     }
@@ -99,26 +124,27 @@ fun TelegramTrimHandles(
             },
     ) {
         Canvas(modifier = Modifier.fillMaxSize()) {
-            canvasSize = IntSize(size.width.toInt(), size.height.toInt())
-
-            val startPx = startFraction * size.width
-            val endPx   = endFraction   * size.width
-            val handleW = 10.dp.toPx()
+            val w = size.width
+            val h = size.height
+            val startPx = startFraction * w
+            val endPx   = endFraction   * w
+            val handleW = 16.dp.toPx()
             val borderH = 3.dp.toPx()
+            val handleR = CornerRadius(4.dp.toPx())
 
-            // Dim the outside-of-selection regions.
+            // Dim the outside-of-selection regions (~60% black, matches Telegram).
             drawRect(
-                color = Color.Black.copy(alpha = 0.55f),
+                color = Color.Black.copy(alpha = 0.6f),
                 topLeft = Offset.Zero,
-                size = Size(startPx, size.height),
+                size = Size(startPx, h),
             )
             drawRect(
-                color = Color.Black.copy(alpha = 0.55f),
+                color = Color.Black.copy(alpha = 0.6f),
                 topLeft = Offset(endPx, 0f),
-                size = Size(size.width - endPx, size.height),
+                size = Size(w - endPx, h),
             )
 
-            // Top + bottom yellow border on the selected range.
+            // Yellow top + bottom borders along the selected range.
             drawRect(
                 color = accentColor,
                 topLeft = Offset(startPx, 0f),
@@ -126,36 +152,60 @@ fun TelegramTrimHandles(
             )
             drawRect(
                 color = accentColor,
-                topLeft = Offset(startPx, size.height - borderH),
+                topLeft = Offset(startPx, h - borderH),
                 size = Size(endPx - startPx, borderH),
             )
 
-            // Left handle (yellow rounded rect with grip lines).
-            drawRect(
+            // Chunky yellow handles, centred on the trim boundary with 4 dp rounding.
+            drawRoundRect(
                 color = accentColor,
                 topLeft = Offset(startPx - handleW / 2f, 0f),
-                size = Size(handleW, size.height),
+                size = Size(handleW, h),
+                cornerRadius = handleR,
             )
-            drawRect(
+            drawRoundRect(
                 color = accentColor,
                 topLeft = Offset(endPx - handleW / 2f, 0f),
-                size = Size(handleW, size.height),
+                size = Size(handleW, h),
+                cornerRadius = handleR,
             )
-            // Grip indicator: thin white vertical line in the centre of each handle.
-            drawLine(
-                color = Color.White,
-                start = Offset(startPx, size.height * 0.3f),
-                end   = Offset(startPx, size.height * 0.7f),
-                strokeWidth = 1.5.dp.toPx(),
-            )
-            drawLine(
-                color = Color.White,
-                start = Offset(endPx, size.height * 0.3f),
-                end   = Offset(endPx, size.height * 0.7f),
-                strokeWidth = 1.5.dp.toPx(),
-            )
+
+            // Two parallel dark grip bars per handle — the Telegram fingerprint.
+            val gripW = 1.5.dp.toPx()
+            val gripH = h * 0.45f
+            val gripTop = (h - gripH) / 2f
+            val gripGap = 3.dp.toPx()
+            val gripColor = Color.Black.copy(alpha = 0.75f)
+            fun drawGrip(centerX: Float) {
+                drawRect(
+                    color = gripColor,
+                    topLeft = Offset(centerX - gripGap / 2f - gripW, gripTop),
+                    size = Size(gripW, gripH),
+                )
+                drawRect(
+                    color = gripColor,
+                    topLeft = Offset(centerX + gripGap / 2f, gripTop),
+                    size = Size(gripW, gripH),
+                )
+            }
+            drawGrip(startPx)
+            drawGrip(endPx)
+
+            // Play-head: bold white pill inside the selection, rounded ends for clarity.
+            playState?.let { p ->
+                if (p in startFraction..endFraction) {
+                    val playX = p * w
+                    val playW = 3.dp.toPx()
+                    drawRoundRect(
+                        color = Color.White,
+                        topLeft = Offset(playX - playW / 2f, borderH),
+                        size = Size(playW, h - borderH * 2f),
+                        cornerRadius = CornerRadius(playW / 2f),
+                    )
+                }
+            }
         }
     }
 }
 
-private enum class DragMode { None, Start, End, Pan }
+private enum class DragMode { None, Start, End, PlayHead }

@@ -89,7 +89,10 @@ class PhotoEditorProState {
     var isTextEditing: Boolean by mutableStateOf(false)
 
     // ---- Tab ----
-    var selectedTab: Tab by mutableStateOf(Tab.Tune)
+    // Nullable: the editor opens with NO tool selected so the user picks one explicitly,
+    // and committing a tool returns to this null state (Telegram-style "fresh slate" between
+    // tool sessions, but more explicit — Telegram always defaults to Enhance).
+    var selectedTab: Tab? by mutableStateOf(null)
 
     fun setParams(update: (FilterParams) -> FilterParams) {
         params = update(params)

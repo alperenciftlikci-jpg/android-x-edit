@@ -54,10 +54,15 @@ android {
 dependencies {
     implementation(projects.libraries.corePerf)
     implementation(libs.timber)
-    // Media3/ExoPlayer for the video editor's preview playback. We only need core +
-    // ui (PlayerView is the AndroidView we mount in Compose); transformer/effect aren't
-    // pulled in because the video pipeline encode happens via our own native code.
+    // Media3/ExoPlayer for the preview player + Transformer for fast trim export
+    // (`experimentalSetTrimOptimizationEnabled` cuts at the keyframe boundary via stream
+    // copy + re-encodes only the leading GOP when the requested start sits mid-GOP).
+    // Works on every ABI since it goes through Android's MediaCodec/MediaMuxer.
     implementation(libs.androidx.media3.exoplayer)
     implementation(libs.androidx.media3.ui)
     implementation(libs.androidx.media3.common)
+    implementation(libs.androidx.media3.transformer)
+    // Telegram-style fast-trim path — direct MP4 atom writer (mdat + moov) that bypasses
+    // Android MediaMuxer's JNI marshalling overhead. Ported from Telegram's MP4Builder.
+    implementation(libs.mp4parser.isoparser)
 }

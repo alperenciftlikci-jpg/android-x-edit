@@ -172,16 +172,20 @@ fun PhotoEditorProScreen(
         val previewBm = withContext(Dispatchers.IO) {
             downsampleForPreview(bm, maxDimension = 1600)
         }
+        // Publish source dimensions + initial preview bitmap BEFORE the async native
+        // setSource call. Otherwise the preview-render LaunchedEffect kicks off with
+        // state.sourceWidth still == 0, computes a 2×2 destination bitmap, renders
+        // garbage into it, and shows that — leaving the user with an empty / black
+        // canvas on first open until something else forces a re-render.
+        state.scaleBrushToSource(previewBm.width, previewBm.height)
+        state.sourceWidth = previewBm.width
+        state.sourceHeight = previewBm.height
+        previewBitmap = previewBm.asImageBitmap()
         sourceBitmap = previewBm
         val ok = withContext(Dispatchers.IO) { nativeEditor.setSource(previewBm) }
         if (!ok) {
             Timber.e("PhotoEditorProScreen: nativeEditor.setSource failed")
             sourceLoadFailed = true
-        } else {
-            state.scaleBrushToSource(previewBm.width, previewBm.height)
-            state.sourceWidth = previewBm.width
-            state.sourceHeight = previewBm.height
-            previewBitmap = previewBm.asImageBitmap()
         }
     }
 
@@ -209,71 +213,49 @@ fun PhotoEditorProScreen(
             )
         }.collectLatest { key ->
             val out = withContext(Dispatchers.IO) {
-                nativeEditor.setFilterParams(state.params)
                 val effectiveCrop = if (key.inCropTab) {
                     state.crop.copy(x = 0f, y = 0f, w = 1f, h = 1f)
                 } else {
                     state.crop
                 }
-                nativeEditor.setCropParams(effectiveCrop)
-                val (cw, ch) = nativeEditor.croppedOutputSize()
+                // Compute dst dims from the source bitmap directly — using state.sourceWidth
+                // could give 0 on the first emission (Compose snapshot system batches state
+                // changes, and the first run can race the source-load coroutine). `src` is
+                // captured at LaunchedEffect launch, so it's always the current bitmap.
+                val srcW = src.width
+                val srcH = src.height
+                val outW = (srcW * effectiveCrop.w).toInt().coerceAtLeast(2)
+                val outH = (srcH * effectiveCrop.h).toInt().coerceAtLeast(2)
+                val (cw, ch) =
+                    if (effectiveCrop.rotation90 % 2 == 1) outH to outW
+                    else outW to outH
                 if (cw <= 0 || ch <= 0) return@withContext null
                 val cached = previewBitmapCacheRef.bitmap
                 val dst = if (cached != null && cached.width == cw && cached.height == ch &&
                               !cached.isRecycled) {
                     cached
                 } else {
-                    cached?.recycle()
                     val fresh = Bitmap.createBitmap(cw, ch, Bitmap.Config.ARGB_8888)
                     previewBitmapCacheRef.bitmap = fresh
                     fresh
                 }
-                if (nativeEditor.exportTo(dst)) dst else null
+                // Single atomic GL task: set params + export. Previously this was four
+                // separate onGl calls each contributing submit()/get() overhead and
+                // separately queueable behind paint-stroke ticks.
+                if (nativeEditor.renderPreviewInto(dst, state.params, effectiveCrop)) dst
+                else null
             }
             if (out != null) previewBitmap = out.asImageBitmap()
         }
     }
 
-    // While the user is on the Text tab editing entities, text rendering lives entirely in
-    // the Compose layer (TelegramTextLayer with one BasicTextField per entity). That mirrors
-    // Telegram's pattern: live EditTexts on top of the photo, no native bitmap round-trip
-    // per keystroke. The native side ONLY composites text at export time. When the user
-    // commits and leaves the Text tab we sync the committed items into native so the photo
-    // preview on Tune / Effects / etc. reflects the typed text.
-    LaunchedEffect(sourceBitmap) {
-        val src = sourceBitmap ?: return@LaunchedEffect
-        snapshotFlow {
-            // Sync to native only when not in Text tab — during text editing the Compose
-            // overlay is the authoritative renderer, so a native composite would cause a
-            // double image. After the user leaves Text tab, snapshot all committed items.
-            Triple(state.selectedTab, state.textItems.toList(), state.textTick)
-        }.collectLatest { (tab, items, _) ->
-            if (tab == PhotoEditorProState.Tab.Text) {
-                // Clear native text composite while editing.
-                withContext(Dispatchers.IO) { nativeEditor.clearText() }
-                return@collectLatest
-            }
-            withContext(Dispatchers.IO) {
-                nativeEditor.clearText()
-                items.forEach { item ->
-                    if (item.text.isBlank()) return@forEach
-                    val bm = TextRenderer.render(
-                        text = item.text,
-                        fontSizePx = item.fontSizePx,
-                        colorArgb = item.colorArgb,
-                    )
-                    nativeEditor.upsertTextItem(
-                        id = item.id,
-                        bitmap = bm,
-                        x = item.centerX * src.width - bm.width * item.scale / 2f,
-                        y = item.centerY * src.height - bm.height * item.scale / 2f,
-                        scale = item.scale,
-                        rotationRad = item.rotationRad,
-                    )
-                }
-            }
-            state.textTick++
-        }
+    // Telegram pattern: text entities are Compose-overlay only during editing. They're
+    // baked into native pixels ONLY at export time (see runApply). This keeps the live
+    // editor consistent regardless of tab — drag/scale/rotate works everywhere, and the
+    // "pre-confirm vs post-confirm" mismatch disappears because there's no native
+    // composite to drift away from. Native text layer is kept empty until export.
+    LaunchedEffect(nativeEditor) {
+        withContext(Dispatchers.IO) { nativeEditor.clearText() }
     }
 
     BackHandler(enabled = !isExporting, onBack = onCancel)
@@ -301,6 +283,12 @@ fun PhotoEditorProScreen(
                         val outcome = runApply(
                             context, nativeEditor, sourceBitmap,
                             textItems = state.textItems.toList(),
+                            // Pass the user-intended params explicitly. runApply uses
+                            // the SAME atomic renderPreviewInto path the live editor
+                            // uses, so the exported JPEG is pixel-identical to what
+                            // the no-tool preview shows.
+                            filterParams = state.params,
+                            cropParams = state.crop,
                         )
                         isExporting = false
                         when (outcome) {
@@ -312,27 +300,41 @@ fun PhotoEditorProScreen(
             }
         }
 
-        // Top bar — Telegram photo editor mirror. The big ✓ on the right is the EXIT-AND-
-        // APPLY action: it bakes the final pixel buffer and dismisses the editor. The bottom
-        // DONE row (below the tab bar) only "commits" the active sub-edit (e.g. closes the
-        // text input) without leaving the editor — same as Telegram's tool/action separation.
+        // Top bar:
+        //   • Left: ✕ — discard everything and dismiss the editor.
+        //   • Right: textual DONE — bake every applied tool's effect into the JPEG and
+        //     dismiss the editor. The bottom ✓ icon (visible only when a tool is active)
+        //     commits THAT tool and returns to no-tool state; this DONE is the page-level
+        //     exit. Paint mode gets an additional undo button between left and right.
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(48.dp)
-                .padding(horizontal = 4.dp),
+                .padding(horizontal = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            TopBarIconButton(Icons.Filled.Close, "Cancel", Color.White, onClick = onCancel)
             if (state.selectedTab == PhotoEditorProState.Tab.Paint) {
+                Spacer(Modifier.size(4.dp))
                 TopBarIconButton(Icons.Filled.Undo, "Undo", Color.White,
                     onClick = { nativeEditor.undoPaint() })
             }
             Spacer(Modifier.weight(1f))
-            TopBarIconButton(
-                icon = Icons.Filled.Check,
-                contentDescription = "Apply & close",
-                tint = TelegramAccent,
-                onClick = triggerApply,
+            BasicText(
+                text = "DONE",
+                style = TextStyle(
+                    color = if (!isExporting && nativeEditor.isReady && !sourceLoadFailed)
+                        TelegramAccent else TelegramAccent.copy(alpha = 0.4f),
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 0.6.sp,
+                ),
+                modifier = Modifier
+                    .clickable(
+                        enabled = !isExporting && nativeEditor.isReady && !sourceLoadFailed,
+                        onClick = triggerApply,
+                    )
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
             )
         }
 
@@ -391,24 +393,46 @@ fun PhotoEditorProScreen(
                 PhotoEditorProState.Tab.Paint -> {
                     val src = sourceBitmap
                     if (src != null) {
+                        // Telegram-style live native render: each pointer sample fires the
+                        // preview pipeline so the user watches the REAL paint FBO update
+                        // (not a Compose-side approximation). Throttle to ~60 fps so we
+                        // never queue up more than one render per display frame; the
+                        // atomic renderPreviewInto call combined with the 1600-source
+                        // downsample keeps each render ≤ 16 ms on real hardware.
+                        val lastTick = remember { object { var t = 0L } }
+                        fun bumpLivePaint() {
+                            val now = System.currentTimeMillis()
+                            if (now - lastTick.t >= 16L) {
+                                lastTick.t = now
+                                state.paintStrokeTick++
+                            }
+                        }
                         TelegramDrawingCanvas(
                             enabled = true,
                             sourceWidth = src.width,
                             sourceHeight = src.height,
+                            // canvasToSource needs the current crop matrix to map a touch
+                            // (in display space, what the user sees) to the source pixel
+                            // the paint engine writes to. Without this a stroke on a
+                            // rotated photo lands at the symmetric position.
+                            cropParams = state.crop,
                             onStrokeBegin = { x, y, p ->
                                 nativeEditor.beginStroke(state.brush, x, y, p)
-                                state.paintStrokeTick++   // kick off live preview re-renders
+                                // Initial tick — render the FIRST stamp immediately so the
+                                // user sees instant feedback when finger lands.
+                                state.paintStrokeTick++
                             },
                             onStrokeExtend = { x, y, p ->
                                 nativeEditor.extendStroke(x, y, p)
-                                // Bump per pointer sample so the preview snapshot flow fires
-                                // and the user watches their stroke build up live, instead of
-                                // only seeing it after they lift their finger.
-                                state.paintStrokeTick++
+                                bumpLivePaint()
                             },
                             onStrokeEnd = {
                                 nativeEditor.endStroke()
                                 state.paintStrokesCommitted.add(System.nanoTime())
+                                // Final render unconditionally — guarantees the last few
+                                // pointer samples (potentially within the 16 ms throttle
+                                // window) make it into the visible preview.
+                                state.paintStrokeTick++
                             },
                             modifier = Modifier.fillMaxSize().padding(8.dp),
                         )
@@ -430,83 +454,114 @@ fun PhotoEditorProScreen(
                             state.isTextEditing = true
                         }
                     }
-                    TelegramTextLayer(
-                        items = state.textItems,
-                        selectedId = state.editingTextId,
-                        isEditing = state.isTextEditing,
-                        onSelect = { newId ->
-                            state.editingTextId = newId
-                            if (newId == null) state.isTextEditing = false
-                        },
-                        onBeginEditing = { id ->
-                            state.editingTextId = id
-                            state.isTextEditing = true
-                        },
-                        onEndEditing = { state.isTextEditing = false },
-                        onItemUpdate = { id, transform ->
-                            state.updateTextItem(id, transform)
-                        },
-                        onTextChange = { id, newText ->
-                            state.updateTextItem(id) { copy(text = newText) }
-                        },
-                        // Hand source dims to the layer so position + font size live in
-                        // source-pixel space (= same space as native export). Without this
-                        // the edit preview and the final JPEG showed text at different
-                        // proportional sizes by the canvas-to-image scale factor.
-                        sourceWidth = sourceBitmap?.width ?: 1,
-                        sourceHeight = sourceBitmap?.height ?: 1,
-                        modifier = Modifier.fillMaxSize().padding(8.dp),
-                    )
                 }
                 else -> Unit
             }
-        }
-
-        // Active tab's sub-controls.
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(TelegramBackground)
-                .padding(vertical = 4.dp),
-        ) {
-            when (state.selectedTab) {
-                PhotoEditorProState.Tab.Tune    -> TuneTabContent(state)
-                PhotoEditorProState.Tab.Effects -> EffectsTabContent(state)
-                PhotoEditorProState.Tab.Blur    -> BlurTabContent(state)
-                PhotoEditorProState.Tab.Crop    -> CropTabContent(state)
-                PhotoEditorProState.Tab.Paint   -> PaintTabContent(state)
-                PhotoEditorProState.Tab.Text    -> TextTabContent(state)
+            // Text entity layer — ALWAYS on top so the user can drag / scale / rotate
+            // text from any tab (Telegram behaviour: entities live on the canvas, the
+            // active tool just changes what you can do with them). Editing the TEXT
+            // CONTENT (keyboard, typing) is gated on `isTextEditing`, which only
+            // flips true while the user is on the Text tab.
+            if (state.textItems.isNotEmpty() ||
+                state.selectedTab == PhotoEditorProState.Tab.Text) {
+                TelegramTextLayer(
+                    items = state.textItems,
+                    selectedId = state.editingTextId,
+                    isEditing = state.isTextEditing,
+                    onSelect = { newId ->
+                        state.editingTextId = newId
+                        if (newId == null) state.isTextEditing = false
+                    },
+                    onBeginEditing = { id ->
+                        state.editingTextId = id
+                        // Only flip into "keyboard / type" mode if the user is actually
+                        // on the Text tab. On other tabs, tapping the text just selects
+                        // it so it can be dragged / scaled / rotated.
+                        if (state.selectedTab == PhotoEditorProState.Tab.Text) {
+                            state.isTextEditing = true
+                        }
+                    },
+                    onEndEditing = { state.isTextEditing = false },
+                    onItemUpdate = { id, transform ->
+                        state.updateTextItem(id, transform)
+                    },
+                    onTextChange = { id, newText ->
+                        state.updateTextItem(id) { copy(text = newText) }
+                    },
+                    sourceWidth = sourceBitmap?.width ?: 1,
+                    sourceHeight = sourceBitmap?.height ?: 1,
+                    // Crop / rotation / mirror state. The layer uses this to letterbox
+                    // text entities against the OUTPUT (cropped + rotated) bitmap's
+                    // aspect — so dragging a text item on a rotated photo lands exactly
+                    // under the finger.
+                    cropParams = state.crop,
+                    // When NOT on Text tab, the layer must not eat background-tap events
+                    // — the underlying tool overlay (Crop, Paint, etc.) needs them.
+                    interceptBackgroundTaps = state.selectedTab == PhotoEditorProState.Tab.Text,
+                    modifier = Modifier.fillMaxSize().padding(8.dp),
+                )
             }
         }
 
-        // Bottom action row — CANCEL exits without applying. DONE *commits the current
-        // sub-edit* (e.g. closes the text input, deselects entity) but stays in the editor
-        // so the user can switch tabs or refine further. The ✓ at the TOP-RIGHT is the
-        // exit-and-apply button. Mirrors Telegram's two-level commit pattern.
-        TelegramBottomActions(
-            cancelLabel = "CANCEL",
-            doneLabel = "DONE",
-            onCancel = onCancel,
-            onDone = {
-                when (state.selectedTab) {
-                    PhotoEditorProState.Tab.Text -> {
-                        // Close the keyboard and drop the selection — Telegram's
-                        // TextPaintView.endEditing() equivalent.
-                        state.editingTextId = null
-                        state.isTextEditing = false
-                    }
-                    PhotoEditorProState.Tab.Paint -> {
-                        // Strokes auto-commit on pointer-up; nothing more to do here.
-                    }
-                    PhotoEditorProState.Tab.Crop, PhotoEditorProState.Tab.Tune,
-                    PhotoEditorProState.Tab.Effects, PhotoEditorProState.Tab.Blur -> {
-                        // No sub-modal state — the live preview already reflects every change.
-                    }
+        // Active tab's sub-controls — only when a tool is actually selected. With no tool
+        // chosen the editor is in "browsing" mode and these stay collapsed.
+        val activeTab = state.selectedTab
+        if (activeTab != null) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(TelegramBackground)
+                    .padding(vertical = 4.dp),
+            ) {
+                when (activeTab) {
+                    PhotoEditorProState.Tab.Tune    -> TuneTabContent(state)
+                    PhotoEditorProState.Tab.Effects -> EffectsTabContent(state)
+                    PhotoEditorProState.Tab.Blur    -> BlurTabContent(state)
+                    PhotoEditorProState.Tab.Crop    -> CropTabContent(state)
+                    PhotoEditorProState.Tab.Paint   -> PaintTabContent(state)
+                    PhotoEditorProState.Tab.Text    -> TextTabContent(state)
                 }
-            },
-            doneEnabled = !isExporting && nativeEditor.isReady && !sourceLoadFailed,
-            accentColor = TelegramAccent,
-        )
+            }
+
+            // Bottom-right ✓ — commit this tool's edit and return to no-tool state. Top-bar
+            // DONE handles full editor exit; this is the per-tool confirm. Telegram's flow
+            // doesn't separate the two but the user asked for an explicit two-level commit:
+            //   ✓ here  = "I'm done with crop / text / paint, take me back to the gallery
+            //              of tools"
+            //   DONE up = "bake everything and dismiss the editor"
+            Row(
+                modifier = Modifier.fillMaxWidth().height(48.dp).padding(horizontal = 16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Spacer(Modifier.weight(1f))
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .background(TelegramAccent.copy(alpha = 0.18f))
+                        .clickable {
+                            // Commit any sub-modal state (close keyboard for Text, etc.)
+                            // and drop the active tool back to null.
+                            if (activeTab == PhotoEditorProState.Tab.Text) {
+                                state.editingTextId = null
+                                state.isTextEditing = false
+                                // Drop a never-typed item — Telegram does the same on
+                                // selectEntity(null) when text is empty.
+                                state.textItems.removeAll { it.text.isBlank() }
+                            }
+                            state.selectedTab = null
+                        },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Check,
+                        contentDescription = "Commit tool",
+                        tint = TelegramAccent,
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
+            }
+        }
 
         // Tab bar
         Box(
@@ -1174,33 +1229,78 @@ private suspend fun runApply(
     nativeEditor: NativePhotoEditor,
     sourceBitmap: Bitmap?,
     textItems: List<io.element.android.libraries.imageeditor.native_.ui.state.TextItemEdit>,
+    filterParams: io.element.android.libraries.imageeditor.native_.FilterParams,
+    cropParams: io.element.android.libraries.imageeditor.native_.CropParams,
 ): ApplyOutcome = withContext(Dispatchers.IO) {
     val src = sourceBitmap
         ?: return@withContext ApplyOutcome.Error("Source image not loaded.")
-    // Telegram bakes text entities into the final pixel buffer only at export. While the
-    // user was on the Text tab the Compose layer owned rendering, so native text composite
-    // was cleared. Now we push every committed item into native right before exportTo so
-    // the JPEG has the typed text on it.
+    // Bake text entities INTO the native composite layer. Frames are rendered into the
+    // bitmap by TextRenderer so they show up in the JPEG identically to the Compose
+    // overlay (same swatch fill / brightness-contrast text / corner radius).
     nativeEditor.clearText()
+    // Pre-compute the crop matrix and its rotation contribution once per export. Text
+    // entity positions are stored in DISPLAY-space (what the user sees in the editor),
+    // not source-space — we feed those fractions through the same matrix the GL crop
+    // shader uses so the native upsert lands at the source pixel that, after the crop
+    // pass, ends up under the user's chosen display position.
+    val cropMatrix =
+        io.element.android.libraries.imageeditor.native_.ui.components.CropUvMatrix.build(cropParams)
+    val cropRotationRad =
+        (((cropParams.rotation90 % 4) + 4) % 4) * (Math.PI.toFloat() / 2f) +
+            cropParams.freeAngle * (Math.PI.toFloat() / 180f)
     textItems.forEach { item ->
         if (item.text.isBlank()) return@forEach
+        val frame = when (item.frameType) {
+            io.element.android.libraries.imageeditor.native_.ui.state.TextFrameType.Solid ->
+                io.element.android.libraries.imageeditor.native_.TextFrame.Solid
+            io.element.android.libraries.imageeditor.native_.ui.state.TextFrameType.Semi ->
+                io.element.android.libraries.imageeditor.native_.TextFrame.Semi
+            io.element.android.libraries.imageeditor.native_.ui.state.TextFrameType.Outline ->
+                io.element.android.libraries.imageeditor.native_.TextFrame.Outline
+            io.element.android.libraries.imageeditor.native_.ui.state.TextFrameType.Plain ->
+                io.element.android.libraries.imageeditor.native_.TextFrame.Plain
+        }
         val bm = TextRenderer.render(
             text = item.text,
             fontSizePx = item.fontSizePx,
             colorArgb = item.colorArgb,
+            frame = frame,
         )
+        // (centerX, centerY) are fractions of the OUTPUT (post-crop, post-rotation)
+        // display area. Apply the crop matrix to get the SOURCE uv that will land there
+        // after the GL crop pass; multiply by source dims to get the source pixel for
+        // the bitmap's centre.
+        val (srcUvX, srcUvY) =
+            io.element.android.libraries.imageeditor.native_.ui.components.CropUvMatrix
+                .apply(cropMatrix, item.centerX, item.centerY)
+        val centreSrcX = srcUvX * src.width
+        val centreSrcY = srcUvY * src.height
+        // Counter-rotate so the text reads upright in the OUTPUT. The native crop pass
+        // will rotate everything in the FBO by `cropRotationRad`; pre-rotating the text
+        // by `-cropRotationRad` cancels that out. The user's own rotationRad (gesture
+        // rotation in the editor) is preserved on top.
         nativeEditor.upsertTextItem(
             id = item.id,
             bitmap = bm,
-            x = item.centerX * src.width - bm.width * item.scale / 2f,
-            y = item.centerY * src.height - bm.height * item.scale / 2f,
+            x = centreSrcX - bm.width * item.scale / 2f,
+            y = centreSrcY - bm.height * item.scale / 2f,
             scale = item.scale,
-            rotationRad = item.rotationRad,
+            rotationRad = item.rotationRad - cropRotationRad,
         )
     }
-    val (cw, ch) = nativeEditor.croppedOutputSize().let {
-        if (it.first <= 0 || it.second <= 0) src.width to src.height else it
-    }
+    // Compute output dimensions from the SAME crop params we're about to render with.
+    // Previously we called `nativeEditor.croppedOutputSize()` which returned dims based on
+    // the LAST setCropParams call — that was the live preview's effective crop (identity
+    // rect during Crop tab). On a non-Crop tab the live preview already set the real
+    // state.crop, so dims agreed, but tapping DONE while on Crop tab produced an export
+    // whose dims didn't match the user-intended crop, and the underlying GL pipeline
+    // skipped the rect-cut because cropParams was stale identity. Compute deterministically
+    // here from the passed cropParams so DONE is always WYSIWYG with the no-tool preview.
+    val outW = (src.width * cropParams.w).toInt().coerceAtLeast(2)
+    val outH = (src.height * cropParams.h).toInt().coerceAtLeast(2)
+    val (cw, ch) =
+        if (cropParams.rotation90 % 2 == 1) outH to outW
+        else outW to outH
     Timber.d("runApply: exporting at %dx%d", cw, ch)
     val dst = try {
         Bitmap.createBitmap(cw, ch, Bitmap.Config.ARGB_8888)
@@ -1208,7 +1308,10 @@ private suspend fun runApply(
         Timber.e(oom, "runApply: OOM creating destination bitmap (%dx%d)", cw, ch)
         return@withContext ApplyOutcome.Error("Image too large to export.")
     }
-    if (!nativeEditor.exportTo(dst)) {
+    // Use renderPreviewInto — the SAME atomic GL path the live preview uses. This pushes
+    // filter + crop params and exports in one task, guaranteeing the JPEG sees the exact
+    // same pixel pipeline as the on-screen preview (no stale-params race between the two).
+    if (!nativeEditor.renderPreviewInto(dst, filterParams, cropParams)) {
         dst.recycle()
         return@withContext ApplyOutcome.Error("Export failed. Check logcat for native errors.")
     }

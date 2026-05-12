@@ -14,7 +14,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
-import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.foundation.text.BasicTextField
@@ -24,25 +23,30 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import io.element.android.libraries.imageeditor.native_.ui.state.TextFrameType
@@ -52,27 +56,27 @@ import kotlin.math.atan2
 import kotlin.math.hypot
 
 /**
- * Faithful Compose port of Telegram's `TextPaintView` entity layer (see
- * `org.telegram.ui.Components.Paint.Views.LPhotoPaintView` / `TextPaintView`).
+ * Compose port of Telegram's `TextPaintView` entity layer. Architecture mirrors
+ * `LPhotoPaintView`:
  *
  *   * Each text item is a movable / scalable / rotatable Box, positioned at its
  *     normalised image-space coordinates over the photo preview.
- *   * Exactly one item is selected at a time. The selected item shows a dashed
- *     border (Telegram calls this the `SelectionView`).
- *   * The selected entity in editing mode hosts a focused `BasicTextField`,
- *     soft keyboard pops up automatically (same as Telegram's `beginEditing`).
- *   * Single-finger drag pans, two-finger gesture scales + rotates in one go.
- *   * Tap on selected = re-edit. Tap on different = swap. Tap on background =
- *     deselect and commit (mirrors LPhotoPaintView.selectEntity(null)).
+ *   * Exactly one item is selected at a time. Selected items show a dashed accent
+ *     border, identical to Telegram's `SelectionView`.
+ *   * **All gestures live on the parent (non-moving) Box**, not on each entity.
+ *     Per-entity pointerInput nested inside a `Modifier.offset` shifted the local
+ *     coordinate system with the entity, producing a feedback loop where a single
+ *     finger drag bounced the entity back-and-forth (`titriyor`). With the
+ *     parent owning gestures, pointer positions stay in stable canvas-pixel space.
+ *   * Hit-testing is done manually against each entity's bounding rect (centre +
+ *     measured size × scale). Bounds are reported per-entity via `onSizeChanged`
+ *     into a state-map.
+ *   * Single-finger drag pans, two fingers scale + rotate. Tap on selected
+ *     entity = re-edit (re-focus IME). Tap on different entity = swap selection.
+ *     Tap on background = deselect.
  *
- * Frame types match Telegram's `currentType` field in TextPaintView:
- *   Solid / Semi / Outline / Plain — colour decisions follow the same brightness
- *   rules `TextPaintView.updateColor()` uses.
- *
- * Live rendering uses the Compose layer only — native pipeline does NOT composite
- * text during preview, so there is no double-render and no native round-trip per
- * keystroke. Native compositing happens once at export time, identical to how
- * Telegram bakes entities into the final JPEG.
+ * Frame types match Telegram's `currentType` field — Solid / Semi / Outline / Plain.
+ * Edit-time rendering is purely Compose; native compositing happens at export.
  */
 @Composable
 fun TelegramTextLayer(
@@ -84,46 +88,149 @@ fun TelegramTextLayer(
     isEditing: Boolean,
     onBeginEditing: (Int) -> Unit,
     onEndEditing: () -> Unit,
-    /** Source image dimensions — required so font size and position can be expressed in
-     *  source-pixel space (the same space used at export). Otherwise the on-screen text
-     *  size and the JPEG'd text size disagree by the image-to-screen scale factor. */
     sourceWidth: Int,
     sourceHeight: Int,
+    /** Current crop / rotation / mirror state. Determines the output bitmap's effective
+     *  dimensions, which is what we letterbox against — without this, dragging a text
+     *  entity on a 90° rotated photo lands in the wrong place because the layer thinks
+     *  the photo is still landscape. */
+    cropParams: io.element.android.libraries.imageeditor.native_.CropParams,
+    /** When false, taps that don't hit an entity are NOT consumed — they propagate to
+     *  whatever pointer-input modifier is layered below (Crop overlay, Paint canvas, etc.).
+     *  Set false from non-Text tabs so the active tool's overlay still receives touches. */
+    interceptBackgroundTaps: Boolean = true,
     modifier: Modifier = Modifier,
     accentColor: Color = Color(0xFF50A8EB),
 ) {
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
-    // Letterbox-aware projection of the source bitmap onto our canvas. Matches Telegram's
-    // entitiesView at `paintingSize` × baseScale layout — every entity is rendered as if
-    // it lived in source-pixel space, scaled uniformly onto the visible photo rect.
-    val imageRect = remember(canvasSize, sourceWidth, sourceHeight) {
+    // Output dims = what's actually drawn on screen post-crop / post-rotation. Letterbox
+    // math runs against THESE, not the raw source. Otherwise text entities float at
+    // positions computed for an un-rotated source aspect while the photo behind them is
+    // rotated → they all visibly miss the photo.
+    val outDims = remember(sourceWidth, sourceHeight, cropParams) {
+        CropUvMatrix.outputDims(sourceWidth, sourceHeight, cropParams)
+    }
+    val imageRect = remember(canvasSize, outDims) {
         computeImageDisplayRect(
             canvasSize.width.toFloat(), canvasSize.height.toFloat(),
-            sourceWidth, sourceHeight,
+            outDims.first, outDims.second,
         )
     }
-    val sourceToScreen = if (sourceWidth > 0) imageRect.width / sourceWidth else 1f
+    val sourceToScreen = if (outDims.first > 0) imageRect.width / outDims.first else 1f
+    // Per-entity measured size (pre-scale, in canvas pixels). The parent uses this to do
+    // hit-testing against each entity's visual extent without going through the entity's
+    // own pointerInput (which would corrupt drag math).
+    val entitySizes = remember { mutableStateMapOf<Int, IntSize>() }
+    // Read latest state from inside the long-lived pointer-input coroutine without
+    // restarting the lambda on every recomposition.
+    val itemsState = rememberUpdatedState(items)
+    val selectedIdState = rememberUpdatedState(selectedId)
+    val imageRectState = rememberUpdatedState(imageRect)
 
+    val interceptBgState = rememberUpdatedState(interceptBackgroundTaps)
     Box(
         modifier = modifier
             .fillMaxSize()
-            // Background-tap deselect — tapping outside any text entity commits the
-            // current edit. Telegram does the same when the user taps the photo.
             .pointerInput(Unit) {
                 awaitEachGesture {
-                    val first = awaitFirstDown(requireUnconsumed = false)
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    val downPos = down.position
+                    val currentItems = itemsState.value
+                    val currentImageRect = imageRectState.value
+                    // Top-most item under the touch wins selection (later in `items` =
+                    // newer / drawn on top).
+                    val hitItem = currentItems.lastOrNull { item ->
+                        hitTestEntity(downPos, item, currentImageRect, entitySizes[item.id])
+                    }
+
+                    if (hitItem == null) {
+                        // Background tap. If we're on a non-Text tab the active tool's
+                        // overlay below needs the event — return WITHOUT consuming. On
+                        // Text tab we wait for lift to deselect.
+                        if (!interceptBgState.value) return@awaitEachGesture
+                        var moved = false
+                        while (true) {
+                            val ev = awaitPointerEvent(PointerEventPass.Final)
+                            val change = ev.changes.firstOrNull() ?: break
+                            if (!change.pressed) {
+                                if (!moved && !change.isConsumed) onSelect(null)
+                                break
+                            }
+                            if (!change.isConsumed) {
+                                val dx = change.position.x - downPos.x
+                                val dy = change.position.y - downPos.y
+                                if (abs(dx) + abs(dy) > 8f) moved = true
+                            }
+                        }
+                        return@awaitEachGesture
+                    }
+
+                    // Entity hit — drive drag / pinch / rotate from this stable coordinate
+                    // frame (canvas pixels, unaffected by the entity's offset / scale).
+                    down.consume()
+                    val hitId = hitItem.id
+                    var prevPos: Offset = downPos
+                    var prevDist: Float? = null
+                    var prevAngle: Float? = null
                     var moved = false
+
                     while (true) {
-                        val ev = awaitPointerEvent(PointerEventPass.Final)
-                        val change = ev.changes.firstOrNull() ?: break
-                        if (!change.pressed) {
-                            if (!moved && !change.isConsumed) onSelect(null)
+                        val ev = awaitPointerEvent(PointerEventPass.Main)
+                        val active = ev.changes.filter { it.pressed }
+                        if (active.isEmpty()) {
+                            // Pointer-up. If the user didn't drag, treat as tap.
+                            if (!moved) {
+                                if (hitId == selectedIdState.value) onBeginEditing(hitId)
+                                else onSelect(hitId)
+                            }
                             break
                         }
-                        if (!change.isConsumed &&
-                            (abs(change.position.x - first.position.x) > 8 ||
-                             abs(change.position.y - first.position.y) > 8)) {
+                        active.forEach { it.consume() }
+                        if (active.size >= 2) {
+                            val a = active[0].position
+                            val b = active[1].position
+                            val dx = a.x - b.x
+                            val dy = a.y - b.y
+                            val dist = hypot(dx, dy)
+                            val angle = atan2(dy, dx)
+                            val pd = prevDist
+                            val pa = prevAngle
+                            if (pd != null && pd > 1f && dist > 1f) {
+                                onItemUpdate(hitId) { cur ->
+                                    cur.copy(scale = (cur.scale * dist / pd).coerceIn(0.3f, 6f))
+                                }
+                            }
+                            if (pa != null) {
+                                var da = angle - pa
+                                val twoPi = (2.0 * Math.PI).toFloat()
+                                if (da > Math.PI.toFloat()) da -= twoPi
+                                if (da < -Math.PI.toFloat()) da += twoPi
+                                onItemUpdate(hitId) { cur ->
+                                    cur.copy(rotationRad = cur.rotationRad + da)
+                                }
+                            }
+                            prevDist = dist
+                            prevAngle = angle
                             moved = true
+                        } else {
+                            val p = active[0].position
+                            val ddx = p.x - prevPos.x
+                            val ddy = p.y - prevPos.y
+                            if (abs(ddx) + abs(ddy) > 0.5f) {
+                                val rect = imageRectState.value
+                                if (rect.width > 0f && rect.height > 0f) {
+                                    onItemUpdate(hitId) { cur ->
+                                        cur.copy(
+                                            centerX = (cur.centerX + ddx / rect.width).coerceIn(0f, 1f),
+                                            centerY = (cur.centerY + ddy / rect.height).coerceIn(0f, 1f),
+                                        )
+                                    }
+                                }
+                                moved = true
+                            }
+                            prevPos = p
+                            prevDist = null
+                            prevAngle = null
                         }
                     }
                 }
@@ -135,40 +242,14 @@ fun TelegramTextLayer(
 
         items.forEach { item ->
             key(item.id) {
-                TextEntity(
+                TextEntityVisual(
                     item = item,
                     isSelected = item.id == selectedId,
                     isEditing = isEditing && item.id == selectedId,
                     imageRect = imageRect,
                     sourceToScreen = sourceToScreen,
                     accentColor = accentColor,
-                    onTap = {
-                        if (item.id == selectedId) onBeginEditing(item.id)
-                        else onSelect(item.id)
-                    },
-                    onMove = { dx, dy ->
-                        // dx/dy are in canvas (screen) pixels; convert to image-fraction.
-                        if (imageRect.width > 0f && imageRect.height > 0f) {
-                            onItemUpdate(item.id) { current ->
-                                current.copy(
-                                    centerX = (current.centerX + dx / imageRect.width)
-                                        .coerceIn(0f, 1f),
-                                    centerY = (current.centerY + dy / imageRect.height)
-                                        .coerceIn(0f, 1f),
-                                )
-                            }
-                        }
-                    },
-                    onScale = { factor ->
-                        onItemUpdate(item.id) { current ->
-                            current.copy(scale = (current.scale * factor).coerceIn(0.3f, 6f))
-                        }
-                    },
-                    onRotate = { deltaRad ->
-                        onItemUpdate(item.id) { current ->
-                            current.copy(rotationRad = current.rotationRad + deltaRad)
-                        }
-                    },
+                    onLayoutSize = { sz -> entitySizes[item.id] = sz },
                     onTextChange = { newText -> onTextChange(item.id, newText) },
                     onEndIme = onEndEditing,
                 )
@@ -177,108 +258,69 @@ fun TelegramTextLayer(
     }
 }
 
+/** Axis-aligned hit-test against an entity's visual bounds. Rotation widens the bounds to
+ *  the rotated bounding rect so a tilted text item still picks up taps near its corners. */
+private fun hitTestEntity(
+    point: Offset,
+    item: TextItemEdit,
+    imageRect: ImageDisplayRect,
+    size: IntSize?,
+): Boolean {
+    if (size == null || size.width == 0 || size.height == 0) return false
+    if (imageRect.width <= 0f || imageRect.height <= 0f) return false
+    val cx = imageRect.left + item.centerX * imageRect.width
+    val cy = imageRect.top + item.centerY * imageRect.height
+    val halfW = size.width * item.scale / 2f
+    val halfH = size.height * item.scale / 2f
+    // Inflate by max(halfW, halfH) for rotation tolerance (cheap, slightly over-permissive).
+    val pad = maxOf(halfW, halfH) - minOf(halfW, halfH)
+    val left = cx - halfW - pad
+    val right = cx + halfW + pad
+    val top = cy - halfH - pad
+    val bottom = cy + halfH + pad
+    return point.x in left..right && point.y in top..bottom
+}
+
 @Composable
-private fun TextEntity(
+private fun TextEntityVisual(
     item: TextItemEdit,
     isSelected: Boolean,
     isEditing: Boolean,
     imageRect: ImageDisplayRect,
-    /** Multiplier turning source-pixel sizes into on-screen pixel sizes. fontSize and any
-     *  other "in image pixels" measurement gets multiplied by this for display. */
     sourceToScreen: Float,
     accentColor: Color,
-    onTap: () -> Unit,
-    onMove: (Float, Float) -> Unit,
-    onScale: (Float) -> Unit,
-    onRotate: (Float) -> Unit,
+    onLayoutSize: (IntSize) -> Unit,
     onTextChange: (String) -> Unit,
     onEndIme: () -> Unit,
 ) {
     if (imageRect.width <= 0f || imageRect.height <= 0f) return
-
     var selfSize by remember { mutableStateOf(IntSize.Zero) }
     Box(modifier = Modifier.fillMaxSize()) {
         Box(
             modifier = Modifier
-                // Telegram-style centred positioning: place the entity's LAYOUT centre on the
-                // photo's (centerX, centerY). graphicsLayer's scale + rotation pivots around
-                // the layout centre (TransformOrigin.Center), so visual centre tracks the
-                // image-space coords regardless of scale or rotation. Position is relative
-                // to imageRect (letterbox-aware), so (0.5, 0.5) always lands on photo centre.
+                // Position the entity's CENTRE on its (centerX, centerY) within the
+                // displayed photo rect. Modifier.offset {} is a layout-phase shift —
+                // the visible position follows the item state, but the parent's
+                // pointerInput is a sibling-level modifier that stays in canvas-pixel
+                // space (it doesn't ride along with our offset).
                 .align(Alignment.TopStart)
                 .offset {
-                    androidx.compose.ui.unit.IntOffset(
+                    IntOffset(
                         x = (imageRect.left + item.centerX * imageRect.width -
                                 selfSize.width / 2f).toInt(),
                         y = (imageRect.top + item.centerY * imageRect.height -
                                 selfSize.height / 2f).toInt(),
                     )
                 }
-                .onSizeChanged { selfSize = it }
+                .onSizeChanged {
+                    selfSize = it
+                    onLayoutSize(it)
+                }
                 .graphicsLayer {
-                    // Scale + rotation only — anchored at the entity's centre.
                     transformOrigin = TransformOrigin.Center
                     scaleX = item.scale
                     scaleY = item.scale
                     rotationZ = Math.toDegrees(item.rotationRad.toDouble()).toFloat()
-                }
-                .pointerInput(item.id) {
-                    awaitEachGesture {
-                        val first = awaitFirstDown(requireUnconsumed = false)
-                        first.consume()
-                        var lastSingleX = first.position.x
-                        var lastSingleY = first.position.y
-                        var prevDist: Float? = null
-                        var prevAngle: Float? = null
-                        var moved = false
-
-                        while (true) {
-                            val ev = awaitPointerEvent(PointerEventPass.Main)
-                            val active = ev.changes.filter { it.pressed }
-                            if (active.isEmpty()) {
-                                if (!moved) onTap()
-                                break
-                            }
-                            active.forEach { it.consume() }
-                            if (active.size >= 2) {
-                                val a = active[0].position
-                                val b = active[1].position
-                                val dx = a.x - b.x
-                                val dy = a.y - b.y
-                                val dist = hypot(dx, dy)
-                                val angle = atan2(dy, dx)
-                                val pd = prevDist
-                                val pa = prevAngle
-                                if (pd != null && pd > 1f && dist > 1f) {
-                                    onScale(dist / pd)
-                                }
-                                if (pa != null) {
-                                    var da = angle - pa
-                                    // Wrap normalisation so a discontinuity doesn't spin
-                                    // the text by ~2π in a single frame.
-                                    val twoPi = (2.0 * Math.PI).toFloat()
-                                    if (da > Math.PI.toFloat()) da -= twoPi
-                                    if (da < -Math.PI.toFloat()) da += twoPi
-                                    onRotate(da)
-                                }
-                                prevDist = dist
-                                prevAngle = angle
-                                moved = true
-                            } else {
-                                val p = active[0].position
-                                val dx = p.x - lastSingleX
-                                val dy = p.y - lastSingleY
-                                if (abs(dx) + abs(dy) > 0.5f) {
-                                    onMove(dx, dy)
-                                    lastSingleX = p.x
-                                    lastSingleY = p.y
-                                    moved = true
-                                }
-                                prevDist = null
-                                prevAngle = null
-                            }
-                        }
-                    }
                 },
         ) {
             TextEntityBody(
@@ -305,12 +347,6 @@ private fun TextEntityBody(
     onEndIme: () -> Unit,
 ) {
     val density = LocalDensity.current
-    // fontSizePx is in source-pixel space — that's what the native exporter (TextRenderer)
-    // uses when baking text into the JPEG. To draw the editor preview at the EXACT same
-    // proportional size, we multiply by the source-to-screen scale ratio. Without this the
-    // edit screen showed text at "source pixel size = on-screen pixel size", which on most
-    // photos was much bigger than what the export ended up with (smaller on screen than in
-    // the bitmap when source > canvas, or vice versa).
     val screenPx = item.fontSizePx * sourceToScreen
     val sizeSp = with(density) { screenPx.toDp().toSp() }
     val swatch = Color(item.colorArgb)
@@ -344,8 +380,6 @@ private fun TextEntityBody(
     val focusRequester = remember { FocusRequester() }
     LaunchedEffect(isEditing) {
         if (isEditing) {
-            // 50 ms tail mirrors Telegram's 300 ms keyboard-reveal delay but tightens
-            // it for Compose — the layout pass completes well before that.
             kotlinx.coroutines.delay(50)
             focusRequester.requestFocus()
         }

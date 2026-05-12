@@ -40,6 +40,7 @@ fun TelegramVideoPlayer(
     isMuted: Boolean,
     onCurrentPositionUpdate: (Long) -> Unit,
     modifier: Modifier = Modifier,
+    seekToMs: Long? = null,
 ) {
     val context = LocalContext.current
 
@@ -55,6 +56,10 @@ fun TelegramVideoPlayer(
     // Apply transient state (play/pause, mute) without rebuilding the player.
     LaunchedEffect(isPlaying) { player.playWhenReady = isPlaying }
     LaunchedEffect(isMuted)   { player.volume = if (isMuted) 0f else 1f }
+
+    // External seek command (scrub via the trim timeline). LaunchedEffect re-fires on each
+    // distinct ms value so rapid drags translate to a sequence of seekTos.
+    LaunchedEffect(seekToMs) { seekToMs?.let { player.seekTo(it) } }
 
     // Loop within [trimStartMs, trimEndMs]: poll ~ 30 ms and seek when we cross the end.
     LaunchedEffect(trimStartMs, trimEndMs, sourceUri) {

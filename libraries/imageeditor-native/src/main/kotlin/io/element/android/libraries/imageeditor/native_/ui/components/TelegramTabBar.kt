@@ -46,7 +46,9 @@ import androidx.compose.ui.unit.sp
 @Composable
 fun <T> TelegramTabBar(
     tabs: List<TabItem<T>>,
-    selected: T,
+    /** `null` means no tab is selected yet — the bar still shows all tabs but draws none
+     *  highlighted, prompting the user to pick a tool. */
+    selected: T?,
     onSelect: (T) -> Unit,
     modifier: Modifier = Modifier,
     accentColor: Color = Color(0xFF50A8EB),
