@@ -178,6 +178,7 @@ class FakeTimeline(
         caption: String?,
         formattedCaption: String?,
         inReplyToEventId: EventId?,
+        isSpoiler: Boolean,
     ): Result<MediaUploadHandler> = simulateLongTask {
         sendImageLambda(
             file,
@@ -207,6 +208,7 @@ class FakeTimeline(
         caption: String?,
         formattedCaption: String?,
         inReplyToEventId: EventId?,
+        isSpoiler: Boolean,
     ): Result<MediaUploadHandler> = simulateLongTask {
         sendVideoLambda(
             file,

@@ -97,6 +97,7 @@ class DefaultMediaSender(
         caption: String?,
         formattedCaption: String?,
         inReplyToEventId: EventId?,
+        isSpoiler: Boolean,
     ): Result<Unit> {
         val mediaLogId = mediaId(mediaUploadInfo.file)
         return getTimeline().flatMap {
@@ -106,6 +107,7 @@ class DefaultMediaSender(
                 caption = caption,
                 formattedCaption = formattedCaption,
                 inReplyToEventId = inReplyToEventId,
+                isSpoiler = isSpoiler,
             )
         }
             .handleSendResult(mediaLogId)
@@ -118,6 +120,7 @@ class DefaultMediaSender(
         formattedCaption: String?,
         inReplyToEventId: EventId?,
         mediaOptimizationConfig: MediaOptimizationConfig,
+        isSpoiler: Boolean,
     ): Result<Unit> {
         return preProcessor
             .process(
@@ -132,6 +135,7 @@ class DefaultMediaSender(
                     caption = caption,
                     formattedCaption = formattedCaption,
                     inReplyToEventId = inReplyToEventId,
+                    isSpoiler = isSpoiler,
                 )
             }
             .handleSendResult(mediaId(uri))
@@ -185,6 +189,7 @@ class DefaultMediaSender(
         caption: String?,
         formattedCaption: String?,
         inReplyToEventId: EventId?,
+        isSpoiler: Boolean = false,
     ): Result<Unit> {
         val handler = when (uploadInfo) {
             is MediaUploadInfo.Image -> {
@@ -195,6 +200,7 @@ class DefaultMediaSender(
                     caption = caption,
                     formattedCaption = formattedCaption,
                     inReplyToEventId = inReplyToEventId,
+                    isSpoiler = isSpoiler,
                 )
             }
             is MediaUploadInfo.Video -> {
@@ -205,6 +211,7 @@ class DefaultMediaSender(
                     caption = caption,
                     formattedCaption = formattedCaption,
                     inReplyToEventId = inReplyToEventId,
+                    isSpoiler = isSpoiler,
                 )
             }
             is MediaUploadInfo.Audio -> {

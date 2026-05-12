@@ -40,7 +40,13 @@ data class ImageMessageType(
     override val caption: String?,
     override val formattedCaption: FormattedBody?,
     val source: MediaSource,
-    val info: ImageInfo?
+    val info: ImageInfo?,
+    /** MSC4193 spoiler flag. When true, recipients should hide the image behind a
+     *  particle overlay until tapped. Populated from the event content's
+     *  `m.spoiler` (or the unstable `org.matrix.msc4193.spoiler` /
+     *  `page.codeberg.everypizza.msc4193.spoiler` prefixes) — defaults false when no
+     *  flag is present. */
+    val isSpoiler: Boolean = false,
 ) : MessageTypeWithAttachment
 
 // FIXME This is never used in production code.
@@ -81,7 +87,9 @@ data class VideoMessageType(
     override val caption: String?,
     override val formattedCaption: FormattedBody?,
     val source: MediaSource,
-    val info: VideoInfo?
+    val info: VideoInfo?,
+    /** See [ImageMessageType.isSpoiler]. */
+    val isSpoiler: Boolean = false,
 ) : MessageTypeWithAttachment
 
 data class FileMessageType(

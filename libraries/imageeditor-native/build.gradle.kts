@@ -50,6 +50,9 @@ android {
 
 dependencies {
     implementation(projects.libraries.corePerf)
+    // SpoilerOverlay lives in :libraries:designsystem so the chat bubble can reuse the
+    // exact same composable the editor uses for preview.
+    implementation(projects.libraries.designsystem)
     implementation(libs.timber)
     implementation(libs.androidx.compose.material.icons)
 }

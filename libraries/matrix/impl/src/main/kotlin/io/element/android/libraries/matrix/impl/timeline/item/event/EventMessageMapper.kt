@@ -92,6 +92,12 @@ class EventMessageMapper {
                 formattedCaption = type.content.formattedCaption?.map(),
                 source = type.content.source.map(),
                 info = type.content.info?.map(),
+                // TODO(MSC4193): the Rust SDK doesn't expose `m.spoiler` on
+                // ImageMessageContent. When upstream ships the structured field,
+                // bind it here. Until then incoming spoiler bits are silently
+                // dropped — we keep the param so all downstream consumers compile
+                // and a future SDK upgrade is a one-line wire-up.
+                isSpoiler = false,
             )
         }
         is RustMessageType.Notice -> {
@@ -110,6 +116,8 @@ class EventMessageMapper {
                 formattedCaption = type.content.formattedCaption?.map(),
                 source = type.content.source.map(),
                 info = type.content.info?.map(),
+                // TODO(MSC4193): see ImageMessageType branch — same SDK gap.
+                isSpoiler = false,
             )
         }
         is RustMessageType.Location -> {

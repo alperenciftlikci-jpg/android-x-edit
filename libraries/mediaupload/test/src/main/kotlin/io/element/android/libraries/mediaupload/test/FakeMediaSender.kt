@@ -34,6 +34,7 @@ class FakeMediaSender(
         caption: String?,
         formattedCaption: String?,
         inReplyToEventId: EventId?,
+        isSpoiler: Boolean,
     ): Result<Unit> {
         return sendPreProcessedMediaResult()
     }
@@ -45,6 +46,7 @@ class FakeMediaSender(
         formattedCaption: String?,
         inReplyToEventId: EventId?,
         mediaOptimizationConfig: MediaOptimizationConfig,
+        isSpoiler: Boolean,
     ): Result<Unit> {
         return sendMediaResult()
     }

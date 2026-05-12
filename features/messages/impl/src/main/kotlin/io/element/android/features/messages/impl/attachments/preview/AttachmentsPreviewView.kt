@@ -144,7 +144,10 @@ fun AttachmentsPreviewView(
             EditorVariant.NativeTelegramStyle -> PhotoEditorProScreen(
                 sourceUri = media.localMedia.uri,
                 onCancel = onCancelEdit,
-                onConfirm = onConfirmEdit,
+                onConfirm = { editedUri, isSpoiler ->
+                    state.eventSink(AttachmentsPreviewEvent.ReplaceMediaUri(editedUri, isSpoiler))
+                    isEditingImage = false
+                },
             )
         }
         return

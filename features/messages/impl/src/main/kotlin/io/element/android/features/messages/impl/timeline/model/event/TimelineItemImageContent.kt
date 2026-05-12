@@ -30,7 +30,10 @@ data class TimelineItemImageContent(
     val height: Int?,
     val thumbnailWidth: Int?,
     val thumbnailHeight: Int?,
-    val aspectRatio: Float?
+    val aspectRatio: Float?,
+    /** MSC4193 spoiler flag, mirrored from [ImageMessageType.isSpoiler]. The bubble
+     *  renders a particle overlay until tapped when this is true. */
+    val isSpoiler: Boolean = false,
 ) : TimelineItemEventContentWithAttachment {
     override val type: String = "TimelineItemImageContent"
 

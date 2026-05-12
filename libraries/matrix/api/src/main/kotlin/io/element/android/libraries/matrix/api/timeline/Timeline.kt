@@ -102,6 +102,10 @@ interface Timeline : AutoCloseable {
         caption: String?,
         formattedCaption: String?,
         inReplyToEventId: EventId?,
+        // MSC4193: when true we attach `m.spoiler: true` (plus unstable prefixes for
+        // cross-client compat) to the outgoing event. Default false so non-editor
+        // callers don't accidentally mark uploads spoiler.
+        isSpoiler: Boolean = false,
     ): Result<MediaUploadHandler>
 
     suspend fun sendVideo(
@@ -111,6 +115,7 @@ interface Timeline : AutoCloseable {
         caption: String?,
         formattedCaption: String?,
         inReplyToEventId: EventId?,
+        isSpoiler: Boolean = false,
     ): Result<MediaUploadHandler>
 
     suspend fun sendAudio(

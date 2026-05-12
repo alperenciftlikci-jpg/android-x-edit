@@ -43,6 +43,9 @@ interface MediaSender {
         caption: String?,
         formattedCaption: String?,
         inReplyToEventId: EventId?,
+        // MSC4193 spoiler flag. Threaded through to the underlying Timeline.sendImage /
+        // sendVideo call so the outgoing event content carries `m.spoiler: true`.
+        isSpoiler: Boolean = false,
     ): Result<Unit>
 
     suspend fun sendMedia(
@@ -52,6 +55,7 @@ interface MediaSender {
         formattedCaption: String? = null,
         inReplyToEventId: EventId? = null,
         mediaOptimizationConfig: MediaOptimizationConfig,
+        isSpoiler: Boolean = false,
     ): Result<Unit>
 
     suspend fun sendVoiceMessage(

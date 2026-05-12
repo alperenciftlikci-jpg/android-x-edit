@@ -113,7 +113,8 @@ class TimelineItemContentMessageFactory(
                     thumbnailHeight = messageType.info?.thumbnailInfo?.height?.coerceIn(MIN_IMAGE_SIZE, MAX_IMAGE_SIZE)?.toInt(),
                     aspectRatio = aspectRatio,
                     formattedFileSize = fileSizeFormatter.format(messageType.info?.size ?: 0),
-                    fileExtension = fileExtensionExtractor.extractFromName(messageType.filename)
+                    fileExtension = fileExtensionExtractor.extractFromName(messageType.filename),
+                    isSpoiler = messageType.isSpoiler,
                 )
             }
             is StickerMessageType -> {

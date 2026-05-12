@@ -55,6 +55,7 @@ import androidx.compose.material.icons.filled.Rotate90DegreesCw
 import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Undo
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
@@ -86,6 +87,7 @@ import io.element.android.libraries.imageeditor.native_.BlurType
 import io.element.android.libraries.imageeditor.native_.BrushType
 import io.element.android.libraries.imageeditor.native_.NativePhotoEditor
 import io.element.android.libraries.imageeditor.native_.TextRenderer
+import io.element.android.libraries.designsystem.components.SpoilerOverlay
 import io.element.android.libraries.imageeditor.native_.ui.components.TabItem
 import io.element.android.libraries.imageeditor.native_.ui.components.TelegramBottomActions
 import io.element.android.libraries.imageeditor.native_.ui.components.TelegramCropOverlay
@@ -122,7 +124,7 @@ private val TelegramYellow = Color(0xFFE5BB3B)
 fun PhotoEditorProScreen(
     sourceUri: Uri,
     onCancel: () -> Unit,
-    onConfirm: (Uri) -> Unit,
+    onConfirm: (uri: Uri, isSpoiler: Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -293,7 +295,7 @@ fun PhotoEditorProScreen(
                         )
                         isExporting = false
                         when (outcome) {
-                            is ApplyOutcome.Success -> onConfirm(outcome.uri)
+                            is ApplyOutcome.Success -> onConfirm(outcome.uri, state.isSpoiler)
                             is ApplyOutcome.Error   -> applyError = outcome.message
                         }
                     }
@@ -351,6 +353,16 @@ fun PhotoEditorProScreen(
                 }
                 else -> Unit
             }
+            // Spoiler toggle. White when off, accent when on. Lives on the top bar so
+            // it's reachable regardless of which tab is active (Telegram surfaces this
+            // in the kebab menu — same idea, slightly more discoverable here).
+            Spacer(Modifier.size(4.dp))
+            TopBarIconButton(
+                Icons.Filled.VisibilityOff,
+                "Spoiler",
+                if (state.isSpoiler) TelegramAccent else Color.White,
+                onClick = { state.toggleSpoiler() },
+            )
             Spacer(Modifier.weight(1f))
             BasicText(
                 text = "DONE",
@@ -382,6 +394,16 @@ fun PhotoEditorProScreen(
                     bitmap = bm,
                     contentDescription = null,
                     contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize().padding(8.dp),
+                )
+            }
+            // Spoiler preview — particle dust on top of the photo so the user sees what
+            // recipients will see. `revealable = false` because the author isn't the
+            // audience; this is purely a preview, the dust never lifts. Sits BELOW the
+            // tab overlays so paint / crop touches still go through.
+            if (state.isSpoiler && previewBitmap != null) {
+                SpoilerOverlay(
+                    revealable = false,
                     modifier = Modifier.fillMaxSize().padding(8.dp),
                 )
             }

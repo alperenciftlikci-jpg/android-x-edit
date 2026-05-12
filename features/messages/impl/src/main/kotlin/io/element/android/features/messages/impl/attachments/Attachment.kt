@@ -16,5 +16,13 @@ import kotlinx.parcelize.Parcelize
 @Immutable
 sealed interface Attachment : Parcelable {
     @Parcelize
-    data class Media(val localMedia: LocalMedia) : Attachment
+    data class Media(
+        val localMedia: LocalMedia,
+        /** True when the user marked this media as a spoiler in the editor. Travels
+         *  unchanged through pre-processing into the final send call, where it lands as
+         *  MSC4193's `m.spoiler` + unstable-prefix flags on the outgoing m.image event.
+         *  Default false so attachments not produced by the editor (e.g. raw gallery
+         *  picks) stay non-spoiler. */
+        val isSpoiler: Boolean = false,
+    ) : Attachment
 }

@@ -373,8 +373,19 @@ class RustTimeline(
         caption: String?,
         formattedCaption: String?,
         inReplyToEventId: EventId?,
+        isSpoiler: Boolean,
     ): Result<MediaUploadHandler> {
-        Timber.tag(loggerTag).d("Sending image ${file.path.hash()}")
+        Timber.tag(loggerTag).d("Sending image ${file.path.hash()} (spoiler=$isSpoiler)")
+        // TODO(MSC4193): UploadParameters in matrix-rust-sdk-android 26.04.21 has no field
+        // for additional content, so we can't attach `m.spoiler: true` to the outgoing
+        // event from this code path. The flag is plumbed all the way down here so that
+        // when the SDK ships MSC4193 (or exposes an `extraContent` map), this is the
+        // single line that needs to be wired up. Until then the bit is dropped and the
+        // sender still sees the editor-side preview overlay, but recipients see the
+        // image without spoiler covering. See: https://github.com/matrix-org/matrix-spec-proposals/pull/4193
+        if (isSpoiler) {
+            Timber.tag(loggerTag).w("MSC4193 spoiler requested but Rust SDK lacks support — bit dropped")
+        }
         return sendAttachment(listOfNotNull(file, thumbnailFile)) {
             inner.sendImage(
                 params = UploadParameters(
@@ -399,8 +410,13 @@ class RustTimeline(
         caption: String?,
         formattedCaption: String?,
         inReplyToEventId: EventId?,
+        isSpoiler: Boolean,
     ): Result<MediaUploadHandler> {
-        Timber.tag(loggerTag).d("Sending video ${file.path.hash()}")
+        Timber.tag(loggerTag).d("Sending video ${file.path.hash()} (spoiler=$isSpoiler)")
+        if (isSpoiler) {
+            // Same SDK gap as sendImage — see comment there.
+            Timber.tag(loggerTag).w("MSC4193 spoiler requested but Rust SDK lacks support — bit dropped")
+        }
         return sendAttachment(listOfNotNull(file, thumbnailFile)) {
             inner.sendVideo(
                 params = UploadParameters(

@@ -215,7 +215,10 @@ class AttachmentsPreviewPresenter(
                 is AttachmentsPreviewEvent.ReplaceMediaUri -> {
                     val media = currentAttachment as? Attachment.Media ?: return
                     val newLocalMedia = media.localMedia.copy(uri = event.uri)
-                    currentAttachment = media.copy(localMedia = newLocalMedia)
+                    currentAttachment = media.copy(
+                        localMedia = newLocalMedia,
+                        isSpoiler = event.isSpoiler,
+                    )
                     // Reset processed state — the new image bytes will be re-pre-processed.
                     sendActionState.value = SendActionState.Idle
                 }

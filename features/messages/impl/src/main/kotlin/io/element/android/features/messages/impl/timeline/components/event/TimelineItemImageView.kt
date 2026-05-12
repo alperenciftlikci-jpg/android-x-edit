@@ -11,8 +11,10 @@ package io.element.android.features.messages.impl.timeline.components.event
 import android.text.SpannedString
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -48,6 +50,7 @@ import io.element.android.features.messages.impl.timeline.model.event.TimelineIt
 import io.element.android.features.messages.impl.timeline.model.event.aTimelineItemImageContent
 import io.element.android.features.messages.impl.timeline.protection.ProtectedView
 import io.element.android.features.messages.impl.timeline.protection.coerceRatioWhenHidingContent
+import io.element.android.libraries.designsystem.components.SpoilerOverlay
 import io.element.android.libraries.designsystem.components.blurhash.blurHashBackground
 import io.element.android.libraries.designsystem.modifiers.onKeyboardContextMenuAction
 import io.element.android.libraries.designsystem.preview.ElementPreview
@@ -86,29 +89,48 @@ fun TimelineItemImageView(
                 hideContent = hideMediaContent,
                 onShowClick = onShowContentClick,
             ) {
-                var isLoaded by remember { mutableStateOf(false) }
-                AsyncImage(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .then(if (isLoaded) Modifier.background(Color.White) else Modifier)
-                        .then(
-                            if (!isTalkbackActive() && onContentClick != null) {
-                                Modifier
-                                    .combinedClickable(
-                                        onClick = onContentClick,
-                                        onLongClick = onLongClick,
-                                    )
-                                    .onKeyboardContextMenuAction(onLongClick)
-                            } else {
-                                Modifier
-                            }
-                        ),
-                    model = content.thumbnailMediaRequestData,
-                    contentScale = ContentScale.Crop,
-                    alignment = Alignment.Center,
-                    contentDescription = description,
-                    onState = { isLoaded = it is AsyncImagePainter.State.Success },
-                )
+                // Track whether the user has tapped to reveal the spoiler. Reveal state
+                // is local — leaving and reopening the chat re-hides the image, which
+                // matches Telegram's "session-only" reveal behaviour.
+                var spoilerRevealed by remember(content.isSpoiler) {
+                    mutableStateOf(!content.isSpoiler)
+                }
+                Box {
+                    var isLoaded by remember { mutableStateOf(false) }
+                    AsyncImage(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(if (isLoaded) Modifier.background(Color.White) else Modifier)
+                            .then(
+                                // Suppress the normal click handler while the spoiler is
+                                // still covering — taps go to the overlay, which performs
+                                // the reveal animation. After reveal the image behaves
+                                // as a normal bubble (opens viewer / long-press menu).
+                                if (spoilerRevealed && !isTalkbackActive() && onContentClick != null) {
+                                    Modifier
+                                        .combinedClickable(
+                                            onClick = onContentClick,
+                                            onLongClick = onLongClick,
+                                        )
+                                        .onKeyboardContextMenuAction(onLongClick)
+                                } else {
+                                    Modifier
+                                }
+                            ),
+                        model = content.thumbnailMediaRequestData,
+                        contentScale = ContentScale.Crop,
+                        alignment = Alignment.Center,
+                        contentDescription = description,
+                        onState = { isLoaded = it is AsyncImagePainter.State.Success },
+                    )
+                    if (!spoilerRevealed) {
+                        SpoilerOverlay(
+                            modifier = Modifier.fillMaxSize(),
+                            revealable = true,
+                            onRevealed = { spoilerRevealed = true },
+                        )
+                    }
+                }
             }
         }
 
