@@ -55,4 +55,8 @@ dependencies {
     implementation(projects.libraries.designsystem)
     implementation(libs.timber)
     implementation(libs.androidx.compose.material.icons)
+    // SpoilerCoilTransformation extends coil3.transform.Transformation so AsyncImage
+    // in the chat bubble can load a pre-blurred bitmap for spoiler state without
+    // applying a render-time Modifier.blur to the original photo.
+    implementation(libs.coil.compose)
 }

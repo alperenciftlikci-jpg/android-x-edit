@@ -19,6 +19,7 @@ import io.element.android.libraries.matrix.api.core.EventId
 import io.element.android.libraries.matrix.api.media.MediaUploadHandler
 import io.element.android.libraries.matrix.api.room.CreateTimelineParams
 import io.element.android.libraries.matrix.api.room.JoinedRoom
+import io.element.android.libraries.matrix.api.spoiler.LocalSpoilerStore
 import io.element.android.libraries.matrix.api.timeline.Timeline
 import io.element.android.libraries.mediaupload.api.MediaOptimizationConfig
 import io.element.android.libraries.mediaupload.api.MediaOptimizationConfigProvider
@@ -100,6 +101,13 @@ class DefaultMediaSender(
         isSpoiler: Boolean,
     ): Result<Unit> {
         val mediaLogId = mediaId(mediaUploadInfo.file)
+        // Stash the spoiler bit in the process-local store, keyed by the filename the
+        // SDK will use on the wire. ALWAYS mark — including `isSpoiler = false` — so
+        // that resending the same filename without a spoiler clears a stash entry left
+        // over from an earlier spoiler send. Set-style semantics here caused a real
+        // bug where the user's second non-spoiler send showed up as spoiler in their
+        // own timeline because the first send's filename was still in the set.
+        LocalSpoilerStore.mark(mediaUploadInfo.file.name, isSpoiler)
         return getTimeline().flatMap {
             Timber.d("Started sending media $mediaLogId using timeline: ${it.mode}")
             it.sendMedia(
@@ -130,6 +138,10 @@ class DefaultMediaSender(
                 mediaOptimizationConfig = mediaOptimizationConfig,
             )
             .flatMapCatching { info ->
+                // Same stash as sendPreProcessedMedia — keyed by the pre-processed file
+                // name. Always mark explicit true/false so a non-spoiler resend clears
+                // any stale entry from an earlier spoiler send of the same filename.
+                LocalSpoilerStore.mark(info.file.name, isSpoiler)
                 getTimeline().getOrThrow().sendMedia(
                     uploadInfo = info,
                     caption = caption,

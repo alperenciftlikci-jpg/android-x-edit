@@ -23,6 +23,7 @@ import io.element.android.libraries.matrix.api.timeline.item.event.OtherMessageT
 import io.element.android.libraries.matrix.api.timeline.item.event.TextMessageType
 import io.element.android.libraries.matrix.api.timeline.item.event.VideoMessageType
 import io.element.android.libraries.matrix.api.timeline.item.event.VoiceMessageType
+import io.element.android.libraries.matrix.api.spoiler.LocalSpoilerStore
 import io.element.android.libraries.matrix.impl.media.map
 import io.element.android.libraries.matrix.impl.room.location.into
 import io.element.android.libraries.matrix.impl.timeline.reply.InReplyToMapper
@@ -93,11 +94,14 @@ class EventMessageMapper {
                 source = type.content.source.map(),
                 info = type.content.info?.map(),
                 // TODO(MSC4193): the Rust SDK doesn't expose `m.spoiler` on
-                // ImageMessageContent. When upstream ships the structured field,
-                // bind it here. Until then incoming spoiler bits are silently
-                // dropped — we keep the param so all downstream consumers compile
-                // and a future SDK upgrade is a one-line wire-up.
-                isSpoiler = false,
+                // ImageMessageContent, so this is the best we can do for now —
+                // ask the process-local stash if WE sent this filename with the
+                // spoiler bit. That handles the sender's local echo correctly.
+                // Cross-client receives (Cinny / FluffyChat writing m.spoiler) still
+                // come through as `false` because we can't read the raw event JSON
+                // from this mapper. When the SDK upgrade lands, replace this with
+                // `type.content.spoiler` and the cross-client path lights up.
+                isSpoiler = LocalSpoilerStore.isSpoiler(type.content.filename),
             )
         }
         is RustMessageType.Notice -> {
@@ -116,8 +120,9 @@ class EventMessageMapper {
                 formattedCaption = type.content.formattedCaption?.map(),
                 source = type.content.source.map(),
                 info = type.content.info?.map(),
-                // TODO(MSC4193): see ImageMessageType branch — same SDK gap.
-                isSpoiler = false,
+                // TODO(MSC4193): see ImageMessageType branch — same SDK gap, same
+                // local-stash workaround for sender's local echo.
+                isSpoiler = LocalSpoilerStore.isSpoiler(type.content.filename),
             )
         }
         is RustMessageType.Location -> {

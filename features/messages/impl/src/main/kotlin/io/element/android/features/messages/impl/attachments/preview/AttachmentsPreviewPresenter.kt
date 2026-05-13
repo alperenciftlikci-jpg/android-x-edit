@@ -182,6 +182,12 @@ class AttachmentsPreviewPresenter(
                             onDoneListener()
                         }
 
+                        // Capture the spoiler bit at click time — the user may already
+                        // have closed this screen by the time the background send fires,
+                        // and reading from a stale `currentAttachment` later could miss
+                        // a toggle that happened just before tapping send.
+                        val isSpoiler = (currentAttachment as? Attachment.Media)?.isSpoiler == true
+
                         // Send the media using the session coroutine scope so it doesn't matter if this screen or the chat one are closed
                         sessionCoroutineScope.launch(dispatchers.io) {
                             sendPreProcessedMedia(
@@ -190,6 +196,7 @@ class AttachmentsPreviewPresenter(
                                 sendActionState = sendActionState,
                                 dismissAfterSend = false,
                                 inReplyToEventId = inReplyToEventId,
+                                isSpoiler = isSpoiler,
                             )
 
                             // Clean up the pre-processed media after it's been sent
@@ -215,12 +222,20 @@ class AttachmentsPreviewPresenter(
                 is AttachmentsPreviewEvent.ReplaceMediaUri -> {
                     val media = currentAttachment as? Attachment.Media ?: return
                     val newLocalMedia = media.localMedia.copy(uri = event.uri)
-                    currentAttachment = media.copy(
-                        localMedia = newLocalMedia,
-                        isSpoiler = event.isSpoiler,
-                    )
+                    // Preserve isSpoiler — the editor doesn't own the bit, the top-bar
+                    // toggle does. Replacing only the URI keeps the user's earlier
+                    // toggle decision intact.
+                    currentAttachment = media.copy(localMedia = newLocalMedia)
                     // Reset processed state — the new image bytes will be re-pre-processed.
                     sendActionState.value = SendActionState.Idle
+                }
+                AttachmentsPreviewEvent.ToggleSpoiler -> {
+                    val media = currentAttachment as? Attachment.Media ?: return
+                    currentAttachment = media.copy(isSpoiler = !media.isSpoiler)
+                    // Spoiler flip doesn't invalidate the pre-processed bytes — same JPEG
+                    // gets uploaded either way, only the m.image content's flag changes.
+                    // So we keep sendActionState as-is; whatever pre-processing has
+                    // already completed remains valid.
                 }
                 AttachmentsPreviewEvent.CancelAndClearSendState -> {
                     // Cancel media sending
@@ -326,6 +341,7 @@ class AttachmentsPreviewPresenter(
         sendActionState: MutableState<SendActionState>,
         dismissAfterSend: Boolean,
         inReplyToEventId: EventId?,
+        isSpoiler: Boolean,
     ) = runCatchingExceptions {
         sendActionState.value = SendActionState.Sending.Uploading(mediaUploadInfo)
         mediaSender.sendPreProcessedMedia(
@@ -333,6 +349,7 @@ class AttachmentsPreviewPresenter(
             caption = caption,
             formattedCaption = null,
             inReplyToEventId = inReplyToEventId,
+            isSpoiler = isSpoiler,
         ).getOrThrow()
     }.fold(
         onSuccess = {

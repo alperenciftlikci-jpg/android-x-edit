@@ -32,6 +32,11 @@ set(SRC_BLUR
     blur/BlurredSource.cpp
 )
 
+set(SRC_SPOILER
+    spoiler/StackBlur.cpp
+    spoiler/spoiler-jni.cpp
+)
+
 set(SRC_TEXT
     text/TextLayer.cpp
 )
@@ -51,6 +56,7 @@ add_library(photoedit SHARED
     ${SRC_CROP}
     ${SRC_PAINT}
     ${SRC_BLUR}
+    ${SRC_SPOILER}
     ${SRC_TEXT}
     ${SRC_JNI}
     ${SRC_FACADE}

@@ -16,7 +16,12 @@ sealed interface AttachmentsPreviewEvent {
     data object CancelAndClearSendState : AttachmentsPreviewEvent
 
     /** Replaces the in-memory media URI after the user finished editing the image.
-     *  `isSpoiler` carries the editor's MSC4193 toggle through to the send call;
-     *  defaults false so non-editor callers don't accidentally mark media as spoiler. */
-    data class ReplaceMediaUri(val uri: Uri, val isSpoiler: Boolean = false) : AttachmentsPreviewEvent
+     *  The spoiler bit is preserved across this event — it lives on `Attachment.Media`
+     *  and is toggled exclusively via [ToggleSpoiler] from the top-bar button. */
+    data class ReplaceMediaUri(val uri: Uri) : AttachmentsPreviewEvent
+
+    /** Toggle the spoiler bit on the current media attachment in-place. Driven by the
+     *  top-bar button so the user can flip it on/off without re-entering the editor —
+     *  matches Telegram's kebab-menu "Hide with Spoiler" affordance on the photo picker. */
+    data object ToggleSpoiler : AttachmentsPreviewEvent
 }

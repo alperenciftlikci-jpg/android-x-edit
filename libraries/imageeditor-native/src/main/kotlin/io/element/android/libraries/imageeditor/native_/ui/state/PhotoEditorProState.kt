@@ -49,14 +49,8 @@ class PhotoEditorProState {
     var sourceHeight: Int by mutableStateOf(0)
         internal set
 
-    // ---- Spoiler flag ----
-    // True when the user has marked the export as "spoiler". This bit travels alongside the
-    // produced JPEG out of the editor: it's NOT baked into the bitmap (the foto bytes stay
-    // pristine — the spoiler is a render-time decision by the recipient, matching MSC4193's
-    // model). The editor preview overlays a particle effect when this is true so the user
-    // sees what they're about to send.
-    var isSpoiler: Boolean by mutableStateOf(false)
-    fun toggleSpoiler() { isSpoiler = !isSpoiler }
+    // Spoiler bit lives on the outer Attachment.Media now — the editor no longer owns it.
+    // See AttachmentsPreviewView's SpoilerToggleButton for the toggle entry point.
 
     // ---- Paint ----
     // Smaller default — Telegram-style. Stroke radius is in source-pixel space, so on a 1080p
@@ -207,7 +201,6 @@ class PhotoEditorProState {
         paintStrokesCommitted.clear()
         blurStrokesCommitted.clear()
         editingTextId = null
-        isSpoiler = false
     }
 
     enum class Tab { Tune, Effects, Blur, Crop, Paint, Text }

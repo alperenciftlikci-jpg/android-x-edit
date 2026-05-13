@@ -55,7 +55,6 @@ import androidx.compose.material.icons.filled.Rotate90DegreesCw
 import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Undo
-import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
@@ -87,7 +86,6 @@ import io.element.android.libraries.imageeditor.native_.BlurType
 import io.element.android.libraries.imageeditor.native_.BrushType
 import io.element.android.libraries.imageeditor.native_.NativePhotoEditor
 import io.element.android.libraries.imageeditor.native_.TextRenderer
-import io.element.android.libraries.designsystem.components.SpoilerOverlay
 import io.element.android.libraries.imageeditor.native_.ui.components.TabItem
 import io.element.android.libraries.imageeditor.native_.ui.components.TelegramBottomActions
 import io.element.android.libraries.imageeditor.native_.ui.components.TelegramCropOverlay
@@ -124,7 +122,7 @@ private val TelegramYellow = Color(0xFFE5BB3B)
 fun PhotoEditorProScreen(
     sourceUri: Uri,
     onCancel: () -> Unit,
-    onConfirm: (uri: Uri, isSpoiler: Boolean) -> Unit,
+    onConfirm: (Uri) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -295,7 +293,7 @@ fun PhotoEditorProScreen(
                         )
                         isExporting = false
                         when (outcome) {
-                            is ApplyOutcome.Success -> onConfirm(outcome.uri, state.isSpoiler)
+                            is ApplyOutcome.Success -> onConfirm(outcome.uri)
                             is ApplyOutcome.Error   -> applyError = outcome.message
                         }
                     }
@@ -353,16 +351,11 @@ fun PhotoEditorProScreen(
                 }
                 else -> Unit
             }
-            // Spoiler toggle. White when off, accent when on. Lives on the top bar so
-            // it's reachable regardless of which tab is active (Telegram surfaces this
-            // in the kebab menu — same idea, slightly more discoverable here).
-            Spacer(Modifier.size(4.dp))
-            TopBarIconButton(
-                Icons.Filled.VisibilityOff,
-                "Spoiler",
-                if (state.isSpoiler) TelegramAccent else Color.White,
-                onClick = { state.toggleSpoiler() },
-            )
+            // No spoiler toggle here — the bit is owned by the outer attachment-preview
+            // screen (next to the dismiss button), matching Telegram's photo-picker UI
+            // where spoiler lives in the kebab menu and the editor itself is just for
+            // visual edits. Keeps state ownership unambiguous: AttachmentsPreviewView is
+            // the single source of truth.
             Spacer(Modifier.weight(1f))
             BasicText(
                 text = "DONE",
@@ -390,20 +383,14 @@ fun PhotoEditorProScreen(
             contentAlignment = Alignment.Center,
         ) {
             previewBitmap?.let { bm ->
+                // Plain Image during editing — the spoiler-preview effect (blurred bitmap +
+                // particle dust) is shown on the outer attachment-preview screen after
+                // DONE, not inside the editor. The editor's job is to make visual edits;
+                // the spoiler bit is a "send option" toggled outside.
                 Image(
                     bitmap = bm,
                     contentDescription = null,
                     contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxSize().padding(8.dp),
-                )
-            }
-            // Spoiler preview — particle dust on top of the photo so the user sees what
-            // recipients will see. `revealable = false` because the author isn't the
-            // audience; this is purely a preview, the dust never lifts. Sits BELOW the
-            // tab overlays so paint / crop touches still go through.
-            if (state.isSpoiler && previewBitmap != null) {
-                SpoilerOverlay(
-                    revealable = false,
                     modifier = Modifier.fillMaxSize().padding(8.dp),
                 )
             }

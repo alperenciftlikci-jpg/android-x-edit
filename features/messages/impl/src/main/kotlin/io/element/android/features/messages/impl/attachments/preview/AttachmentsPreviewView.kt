@@ -49,6 +49,14 @@ import io.element.android.libraries.core.mimetype.MimeTypes.isMimeTypeImage
 import io.element.android.libraries.core.mimetype.MimeTypes.isMimeTypeVideo
 import io.element.android.libraries.designsystem.components.ProgressDialog
 import io.element.android.libraries.designsystem.components.ProgressDialogType
+import androidx.compose.runtime.produceState
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
+import io.element.android.libraries.imageeditor.native_.ui.components.SpoileredImage
+import io.element.android.libraries.imageeditor.native_.ui.components.SpoilerToggleButton
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import io.element.android.libraries.designsystem.components.button.BackButton
 import io.element.android.libraries.designsystem.components.dialogs.AlertDialog
 import io.element.android.libraries.designsystem.components.dialogs.ListDialog
@@ -144,10 +152,11 @@ fun AttachmentsPreviewView(
             EditorVariant.NativeTelegramStyle -> PhotoEditorProScreen(
                 sourceUri = media.localMedia.uri,
                 onCancel = onCancelEdit,
-                onConfirm = { editedUri, isSpoiler ->
-                    state.eventSink(AttachmentsPreviewEvent.ReplaceMediaUri(editedUri, isSpoiler))
-                    isEditingImage = false
-                },
+                // Editor no longer owns the spoiler bit — it produces a plain edited URI
+                // and the AttachmentsPreviewView's top-bar SpoilerToggleButton handles
+                // the flag separately. `ReplaceMediaUri` preserves the existing
+                // attachment's isSpoiler (defaults false; presenter merges it explicitly).
+                onConfirm = onConfirmEdit,
             )
         }
         return
@@ -174,10 +183,29 @@ fun AttachmentsPreviewView(
         topBar = {
             TopAppBar(
                 navigationIcon = {
-                    BackButton(
-                        imageVector = CompoundIcons.Close(),
-                        onClick = ::postCancel,
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        BackButton(
+                            imageVector = CompoundIcons.Close(),
+                            onClick = ::postCancel,
+                        )
+                        // Telegram-style spoiler toggle right next to the dismiss icon —
+                        // matches the kebab-menu placement on Telegram's photo picker.
+                        // Only meaningful for images today; we hide for video / file so
+                        // the top bar doesn't accumulate inactive controls. The
+                        // composable itself ships from :libraries:imageeditor-native
+                        // (alongside the SpoilerOverlay it pairs with).
+                        if (isImage) {
+                            val mediaForSpoiler = state.attachment as? Attachment.Media
+                            if (mediaForSpoiler != null) {
+                                SpoilerToggleButton(
+                                    isSpoiler = mediaForSpoiler.isSpoiler,
+                                    onClick = {
+                                        state.eventSink(AttachmentsPreviewEvent.ToggleSpoiler)
+                                    },
+                                )
+                            }
+                        }
+                    }
                 },
                 title = {},
                 actions = {
@@ -299,7 +327,49 @@ private fun AttachmentPreviewContent(
         ) {
             when (val attachment = state.attachment) {
                 is Attachment.Media -> {
-                    localMediaRenderer.Render(attachment.localMedia)
+                    // Spoiler-on for images: load the bitmap and render via SpoileredImage
+                    // — that composable wraps Image + SpoilerOverlay in a Box constrained
+                    // to the photo's aspect ratio, so the dust + downscale-blur backdrop
+                    // both sit inside the actual image rect (not the surrounding letterbox).
+                    // Without this, the overlay would paint the whole preview pane
+                    // including the dark space above/below the photo.
+                    //
+                    // For videos / non-image attachments we fall back to the regular
+                    // renderer — videos don't expose a frame bitmap synchronously, so a
+                    // proper SpoileredImage variant for them is a separate effort.
+                    val context = LocalContext.current
+                    val attachmentMimeType = attachment.localMedia.info.mimeType
+                    val isImageAttachment = attachmentMimeType.isMimeTypeImage() == true
+                    if (attachment.isSpoiler && isImageAttachment) {
+                        val previewBitmap = produceState<ImageBitmap?>(initialValue = null, attachment.localMedia.uri) {
+                            // Decode on IO; first frame of the screen renders without the
+                            // spoiler effect, then snaps to SpoileredImage once the bitmap
+                            // arrives. Cheap one-shot decode — same bytes localMediaRenderer
+                            // would have loaded anyway.
+                            value = withContext(Dispatchers.IO) {
+                                runCatching {
+                                    context.contentResolver.openInputStream(attachment.localMedia.uri)
+                                        ?.use { android.graphics.BitmapFactory.decodeStream(it) }
+                                        ?.asImageBitmap()
+                                }.getOrNull()
+                            }
+                        }
+                        val bm = previewBitmap.value
+                        if (bm != null) {
+                            SpoileredImage(
+                                bitmap = bm,
+                                isSpoiler = true,
+                                revealable = false,
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                        } else {
+                            // Brief pre-decode window — show the renderer as a fallback so
+                            // the user isn't staring at a blank pane.
+                            localMediaRenderer.Render(attachment.localMedia)
+                        }
+                    } else {
+                        localMediaRenderer.Render(attachment.localMedia)
+                    }
                 }
             }
         }

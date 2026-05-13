@@ -215,6 +215,11 @@ android {
 
         jniLibs {
             useLegacyPackaging = project.findProperty("useLegacyPackaging")?.toString()?.toBoolean()
+            // imageeditor-native and matrix-backtrace both ship a copy of libc++_shared.so.
+            // pickFirst is safe — they're both the standard NDK STL runtime, just packaged
+            // by different upstream dependencies. The first match wins, the duplicate is
+            // dropped from the APK.
+            pickFirsts += setOf("**/libc++_shared.so")
         }
     }
 }
