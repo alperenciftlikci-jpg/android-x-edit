@@ -14,7 +14,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
@@ -100,10 +100,20 @@ fun TimelineItemImageView(
             ) {
                 // Persist reveal state via the process-wide store — see
                 // LocalSpoilerRevealStore docs for the LazyColumn-recycle rationale.
-                val revealKey = remember(content.filename, content.mediaSource) {
-                    "${content.filename}|${content.mediaSource.safeUrl}"
-                }
-                var spoilerRevealed by remember(revealKey, content.isSpoiler) {
+                //
+                // Key is filename only — NOT filename + mediaSource.safeUrl. The SDK
+                // emits two content updates per send (local echo with file:// source,
+                // then confirmed echo with mxc:// source). Including the URL in this
+                // remember key meant the `mutableStateOf` underneath got a new state
+                // instance on the local→remote transition, and Compose's
+                // "state-identity changed" pathway forced an extra recompose on every
+                // composable observing spoilerRevealed. That extra recompose is the
+                // hard flash users reported on `version1.0.2` that wasn't on `main`.
+                // Filename is stable across the SDK's local→remote upgrade because
+                // AndroidMediaPreProcessor.postProcess renames the temp file to the
+                // source URI's leaf name and the SDK carries it through unchanged.
+                val revealKey = content.filename
+                var spoilerRevealed by remember(content.filename, content.isSpoiler) {
                     mutableStateOf(!content.isSpoiler || LocalSpoilerRevealStore.isRevealed(revealKey))
                 }
                 // Telegram's two-bitmap model literally. The bottom AsyncImage is
@@ -128,16 +138,25 @@ fun TimelineItemImageView(
                         null
                     }
                 }
-                Box {
+                // `propagateMinConstraints = true` is the missing piece. Upstream's
+                // AsyncImage is a DIRECT child of `TimelineItemAspectRatioBox` (also a
+                // Box) — when Compose lays it out, the aspectRatio modifier sets that
+                // outer Box to tight constraints, and a Box's own default (with
+                // `propagateMinConstraints = false`) loosens those when passing them
+                // to children. Upstream's AsyncImage gets the TIGHT constraints
+                // because nothing intervenes; our intermediate Box was loosening them,
+                // so AsyncImage measured itself smaller (intrinsic-based) and the
+                // re-measure when the bitmap arrived produced the visible flash.
+                // Propagating min constraints makes the inner Box behave like the
+                // direct-child case upstream relies on.
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    propagateMinConstraints = true,
+                ) {
                     var isLoaded by remember { mutableStateOf(false) }
-                    // Bottom: original photo. Identical to main's AsyncImage call —
-                    // same modifier (fillMaxWidth + bg + click), same model, same
-                    // contentScale. The bubble's layout chain ends here exactly as
-                    // it did pre-spoiler, so the photo renders pixel-for-pixel like
-                    // version1.0.1.
                     AsyncImage(
                         modifier = Modifier
-                            .fillMaxWidth()
+                            .fillMaxSize()
                             .then(if (isLoaded) Modifier.background(Color.White) else Modifier)
                             .then(
                                 if (spoilerRevealed && !isTalkbackActive() && onContentClick != null) {
