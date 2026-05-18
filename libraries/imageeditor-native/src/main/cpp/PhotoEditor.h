@@ -32,6 +32,10 @@ public:
     bool setSourceBitmap(const uint8_t* rgba, int width, int height);
     void setFilterParams(const FilterParams& params);
     void setCropParams(const CropParams& params);
+    /** Re-run the BlurredSource pre-blur with the given Gaussian sigma. Used by
+     *  the Blur-tab "Strength" slider to retune how hard text / detail is hidden
+     *  under blur-brush strokes; clamped to a safe range inside the renderer. */
+    void setBlurSigma(float sigma);
     void croppedOutputSize(int& w, int& h) const;
 
     // Paint API forwarders. Direct access to the engine via paint() lets the
@@ -39,6 +43,18 @@ public:
     // adding dozens of facade methods.
     PaintEngine* paint();
     TextLayer*   text();
+
+    // Bake the active blur stroke at the renderer's current sigma into the
+    // committed-blur layer. JNI invokes this right after `paint()->endStroke()`
+    // when the just-ended stroke was a BlurBrush, so each stroke locks in the
+    // strength that was live when the user lifted their finger.
+    void commitActiveBlurStroke();
+
+    // Undo / redo for the committed blur layer. The blur stack lives on the
+    // Renderer (not PaintEngine) because the committed layer is what changes
+    // across strokes now — the in-progress mask is cleared each commit.
+    void undoBlurLayer();
+    void redoBlurLayer();
 
     // Export the current pipeline output (filter chain → optional crop → FBO
     // → glReadPixels into outRgba).

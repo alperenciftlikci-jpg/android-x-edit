@@ -187,6 +187,12 @@ fun PhotoEditorProScreen(
             Timber.e("PhotoEditorProScreen: nativeEditor.setSource failed")
             sourceLoadFailed = true
         }
+        // Sync the native pre-blur sigma to whatever the state currently holds.
+        // setSource resets the renderer's internal sigma to its default; if the user
+        // adjusted the Strength slider earlier in the session (e.g. after editor
+        // dismiss/re-open with the same source), apply that here so the blur brush
+        // matches the slider position without requiring a re-drag.
+        nativeEditor.setBlurSigma(state.blurBrushSigma)
     }
 
     // Re-render preview whenever any state slice changes — including the paint stroke tick,
@@ -602,7 +608,7 @@ fun PhotoEditorProScreen(
                 when (activeTab) {
                     PhotoEditorProState.Tab.Tune    -> TuneTabContent(state)
                     PhotoEditorProState.Tab.Effects -> EffectsTabContent(state)
-                    PhotoEditorProState.Tab.Blur    -> BlurTabContent(state)
+                    PhotoEditorProState.Tab.Blur    -> BlurTabContent(state, nativeEditor)
                     PhotoEditorProState.Tab.Crop    -> CropTabContent(state)
                     PhotoEditorProState.Tab.Paint   -> PaintTabContent(state)
                     PhotoEditorProState.Tab.Text    -> TextTabContent(state)
@@ -824,7 +830,7 @@ private fun EffectsTabContent(state: PhotoEditorProState) {
 }
 
 @Composable
-private fun BlurTabContent(state: PhotoEditorProState) {
+private fun BlurTabContent(state: PhotoEditorProState, nativeEditor: NativePhotoEditor) {
     val p = state.params
     // Two distinct mechanisms share this tab:
     //   • Radial / Linear: filter-style gaussian masked by a shape, parameter-driven.
@@ -862,6 +868,23 @@ private fun BlurTabContent(state: PhotoEditorProState) {
                 range = 2f..48f,
                 onValueChange = state::setBrushSize,
                 defaultValue = 12f,
+                accentColor = TelegramAccent,
+            )
+            // Brush blur intensity. Updates the native pre-blur Gaussian sigma and
+            // bumps the preview tick so the next render reflects the new blur. The
+            // native side debounces the heavy work — sigma re-set runs the 2-pass
+            // separable Gaussian once per dispatch, so even continuous slider drag
+            // stays smooth on modern phones.
+            TelegramSimpleSlider(
+                label = "Strength",
+                value = state.blurBrushStrength,
+                range = 0f..1f,
+                onValueChange = { v ->
+                    state.updateBlurBrushStrength(v)
+                    nativeEditor.setBlurSigma(state.blurBrushSigma)
+                    state.paintStrokeTick++
+                },
+                defaultValue = 0.1f,
                 accentColor = TelegramAccent,
             )
         } else {

@@ -129,8 +129,6 @@ void PaintEngine::release() {
     stampQuad_.release();
     undoableSnapshots_.clear();
     redoableSnapshots_.clear();
-    undoableBlurSnapshots_.clear();
-    redoableBlurSnapshots_.clear();
     rawPoints_.clear();
     densified_.clear();
     inStroke_ = false;
@@ -258,14 +256,12 @@ void PaintEngine::endStroke() {
         }
     }
 
-    // Snapshot the layer the current brush actually wrote to. BlurBrush pushes
-    // to the blur stack; everything else (pen / marker / neon / arrow / eraser)
-    // pushes to the paint stack. Keeping the two stacks decoupled lets each
-    // tool tab undo independently of the other.
-    if (currentBrush_.type == BrushType::BlurBrush) {
-        pushSnapshot(blurMaskFbo_, undoableBlurSnapshots_, /*capToMax=*/true);
-        redoableBlurSnapshots_.clear();
-    } else {
+    // Paint strokes (Pen / Marker / Neon / Arrow / Eraser) push to the paint
+    // undo stack here. BlurBrush is handled by the Renderer's bake step
+    // (`Renderer::commitActiveBlurStroke`) right after this returns — it
+    // snapshots the committed blur layer and clears the mask, so PaintEngine
+    // doesn't need to touch any blur state.
+    if (currentBrush_.type != BrushType::BlurBrush) {
         pushSnapshot(paintFbo_, undoableSnapshots_, /*capToMax=*/true);
         redoableSnapshots_.clear();
     }
@@ -478,13 +474,12 @@ void PaintEngine::redoPaintLayer() {
                   kMaxSnapshots, *this);
 }
 
-void PaintEngine::undoBlurLayer() {
-    undoLayerImpl(blurMaskFbo_, undoableBlurSnapshots_, redoableBlurSnapshots_, *this);
-}
-
-void PaintEngine::redoBlurLayer() {
-    redoLayerImpl(blurMaskFbo_, undoableBlurSnapshots_, redoableBlurSnapshots_,
-                  kMaxSnapshots, *this);
+void PaintEngine::clearBlurMask() {
+    if (!ready_) return;
+    blurMaskFbo_.bind();
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    Framebuffer::bindDefault();
 }
 
 void PaintEngine::clear() {
@@ -498,8 +493,6 @@ void PaintEngine::clear() {
     Framebuffer::bindDefault();
     undoableSnapshots_.clear();
     redoableSnapshots_.clear();
-    undoableBlurSnapshots_.clear();
-    redoableBlurSnapshots_.clear();
 }
 
 } // namespace photoedit

@@ -164,6 +164,17 @@ Java_io_element_android_libraries_imageeditor_native_1_NativePhotoEditor_nativeS
     if (e->makeContextCurrent()) e->setCropParams(p);
 }
 
+// Re-run the BlurredSource pre-blur with a new Gaussian sigma. Called from the
+// Blur tab's "Strength" slider on slider-release; the renderer clamps sigma to
+// its safe range internally so no input validation is needed here.
+JNIEXPORT void JNICALL
+Java_io_element_android_libraries_imageeditor_native_1_NativePhotoEditor_nativeSetBlurSigma(
+        JNIEnv* /*env*/, jobject /*thiz*/, jlong handle, jfloat sigma) {
+    auto* e = asEditor(handle);
+    if (!e) return;
+    if (e->makeContextCurrent()) e->setBlurSigma(static_cast<float>(sigma));
+}
+
 // Paint API. Brush params packed as a float[8]:
 //   [0] type (BrushType ordinal as float)
 //   [1..4] colour RGBA  [5] radiusPx  [6] hardness
@@ -209,7 +220,14 @@ Java_io_element_android_libraries_imageeditor_native_1_NativePhotoEditor_nativeE
     auto* e = asEditor(handle);
     if (!e || !e->makeContextCurrent()) return;
     auto* paint = e->paint();
-    if (paint) paint->endStroke();
+    if (!paint) return;
+    const bool wasBlur = paint->lastBrushType() == photoedit::BrushType::BlurBrush;
+    paint->endStroke();
+    // For blur strokes the in-progress mask now needs to be baked into the
+    // committed-blur layer at the current sigma — see PhotoEditor's facade
+    // for the rationale. Doing this in JNI (not PaintEngine) keeps PaintEngine
+    // unaware of the renderer's blur pipeline.
+    if (wasBlur) e->commitActiveBlurStroke();
 }
 
 JNIEXPORT void JNICALL
@@ -230,14 +248,14 @@ JNIEXPORT void JNICALL
 Java_io_element_android_libraries_imageeditor_native_1_NativePhotoEditor_nativeUndoBlur(
         JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
     auto* e = asEditor(handle);
-    if (e && e->makeContextCurrent() && e->paint()) e->paint()->undoBlurLayer();
+    if (e && e->makeContextCurrent()) e->undoBlurLayer();
 }
 
 JNIEXPORT void JNICALL
 Java_io_element_android_libraries_imageeditor_native_1_NativePhotoEditor_nativeRedoBlur(
         JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
     auto* e = asEditor(handle);
-    if (e && e->makeContextCurrent() && e->paint()) e->paint()->redoBlurLayer();
+    if (e && e->makeContextCurrent()) e->redoBlurLayer();
 }
 
 JNIEXPORT void JNICALL

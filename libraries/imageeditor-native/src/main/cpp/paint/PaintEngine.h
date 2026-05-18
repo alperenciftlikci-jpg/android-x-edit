@@ -39,19 +39,29 @@ public:
 
     // Layer-scoped undo / redo. Each brush only pushes snapshots into the
     // stack that matches the layer it draws to: colour brushes (Pen / Marker /
-    // Neon / Arrow / Eraser) → paint stack, BlurBrush → blur stack. This lets
-    // the UI expose two separate undo affordances (one per tab) that don't
-    // disturb each other.
+    // Neon / Arrow / Eraser) → paint stack. Blur strokes no longer snapshot
+    // here — the Renderer owns the per-stroke baked blur layer and its own
+    // undo stack (see `Renderer::undoBlurLayer`), so the two affordances stay
+    // independent without PaintEngine having to track the bake state.
     void undoPaintLayer();
     void redoPaintLayer();
-    void undoBlurLayer();
-    void redoBlurLayer();
     void clear();
 
+    // Wipe the blur-brush mask FBO (no undo snapshot — only called by the
+    // Renderer immediately after baking an active stroke into its committed
+    // layer, at which point keeping the now-redundant mask state would just
+    // double-render the blur on the next frame).
+    void clearBlurMask();
+
     bool hasStrokes() const {
-        return !undoableSnapshots_.empty() || !redoableSnapshots_.empty() ||
-               !undoableBlurSnapshots_.empty() || !redoableBlurSnapshots_.empty();
+        return !undoableSnapshots_.empty() || !redoableSnapshots_.empty();
     }
+
+    // Type of the brush passed to the most recent `beginStroke`. Used by the
+    // Renderer right after `endStroke()` to decide whether the just-ended
+    // stroke needs a blur-bake pass; cheaper than threading the brush type
+    // back through the JNI return value.
+    BrushType lastBrushType() const { return currentBrush_.type; }
 
     // The accumulated paint layer (the texture the caller composites on top
     // of the filtered image). Result is RGBA premultiplied.
@@ -105,14 +115,12 @@ private:
     bool inStroke_ = false;
 
     // Undo/redo: each entry is a Texture (move-only), capped to N. Pushing past
-    // N drops the oldest entry (FIFO); popping from undo moves to redo.
-    // Paint and blur layers live on independent stacks so the user can undo
-    // strokes in one layer without disturbing the other — they're conceptually
-    // different tools (Paint tab vs Blur tab) and each gets its own affordance.
+    // N drops the oldest entry (FIFO); popping from undo moves to redo. Paint
+    // strokes (Pen / Marker / Neon / Arrow / Eraser) live here; blur strokes
+    // are baked into the Renderer's committed-blur layer at stroke end and
+    // its undo stack handles their rollback.
     std::vector<std::unique_ptr<Texture>> undoableSnapshots_;
     std::vector<std::unique_ptr<Texture>> redoableSnapshots_;
-    std::vector<std::unique_ptr<Texture>> undoableBlurSnapshots_;
-    std::vector<std::unique_ptr<Texture>> redoableBlurSnapshots_;
     static constexpr size_t kMaxSnapshots = 20;
 
     bool compileShaders();

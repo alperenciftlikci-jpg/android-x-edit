@@ -43,6 +43,10 @@ void PhotoEditor::setCropParams(const CropParams& params) {
     if (renderer_) renderer_->setCropParams(params);
 }
 
+void PhotoEditor::setBlurSigma(float sigma) {
+    if (renderer_) renderer_->setBlurSigma(sigma);
+}
+
 void PhotoEditor::croppedOutputSize(int& w, int& h) const {
     if (renderer_) renderer_->croppedOutputSize(w, h);
     else { w = h = 0; }
@@ -54,6 +58,18 @@ PaintEngine* PhotoEditor::paint() {
 
 TextLayer* PhotoEditor::text() {
     return renderer_ ? &renderer_->text() : nullptr;
+}
+
+void PhotoEditor::commitActiveBlurStroke() {
+    if (renderer_) renderer_->commitActiveBlurStroke();
+}
+
+void PhotoEditor::undoBlurLayer() {
+    if (renderer_) renderer_->undoBlurLayer();
+}
+
+void PhotoEditor::redoBlurLayer() {
+    if (renderer_) renderer_->redoBlurLayer();
 }
 
 bool PhotoEditor::exportToBitmap(uint8_t* outRgba, int outWidth, int outHeight) {

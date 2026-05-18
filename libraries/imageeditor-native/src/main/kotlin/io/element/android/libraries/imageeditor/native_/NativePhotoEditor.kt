@@ -113,6 +113,18 @@ class NativePhotoEditor : AutoCloseable {
         onGl { nativeSetCropParams(handle, params.toFloatArray()) }
     }
 
+    /** Set the Gaussian sigma the blur-brush pipeline pre-blurs the source with. Sigma is
+     *  interpreted in 1/8-res space (the native blur runs on a downsampled copy), so the
+     *  full-res equivalent is ~8× this number; the renderer clamps to ~0.5..10. Re-runs
+     *  the 2-pass blur on the next GL tick; callers should bump the preview-tick state to
+     *  trigger a re-render afterwards. Note that this only affects the active in-progress
+     *  stroke's live preview and the next stroke's bake — already-committed strokes keep
+     *  the sigma they were drawn with. */
+    fun setBlurSigma(sigma: Float) {
+        if (handle == 0L) return
+        onGl { nativeSetBlurSigma(handle, sigma) }
+    }
+
     /** One-shot render path. Atomically updates filter + crop params, then exports into the
      *  destination bitmap, all on the dedicated GL thread. Previously the preview loop
      *  invoked four separate `onGl` blocks (setFilterParams / setCropParams /
@@ -264,6 +276,7 @@ class NativePhotoEditor : AutoCloseable {
         curveIsIdentity: Boolean,
     )
     private external fun nativeSetCropParams(handle: Long, packed: FloatArray)
+    private external fun nativeSetBlurSigma(handle: Long, sigma: Float)
     private external fun nativeCroppedOutputSize(handle: Long): IntArray
     private external fun nativeBeginStroke(handle: Long, brush: FloatArray, x: Float, y: Float, pressure: Float)
     private external fun nativeExtendStroke(handle: Long, x: Float, y: Float, pressure: Float)

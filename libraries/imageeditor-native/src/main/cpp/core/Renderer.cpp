@@ -83,23 +83,28 @@ bool Renderer::init() {
         return false;
     }
 
-    // Blur reveal: where the brush mask is opaque, swap the composed image's
-    // RGB for the pre-blurred source's RGB. Alpha is preserved from the base,
-    // so the reveal never punches through a previously-transparent pixel.
-    // `mix(base.rgb, blurred.rgb, mask.a)` is the same compositing op
-    // Telegram's Brush.Blurer uses on its native side.
+    // Blur reveal: composite the *committed* baked blur over the base first
+    // (each baked stroke carries the sigma it was drawn with), then mix in the
+    // active in-progress stroke using the live `blurredSource_` (current
+    // slider sigma). Two-stage layering keeps already-finished strokes frozen
+    // at their per-stroke intensity while still giving the user a true live
+    // preview of the stroke they're currently dragging.
     static constexpr const char* kBlurRevealFs = R"(#version 300 es
         precision highp float;
         uniform sampler2D u_base;
         uniform sampler2D u_blurred;
         uniform sampler2D u_blurMask;
+        uniform sampler2D u_committedBlur;
         in vec2 v_uv;
         out vec4 fragColor;
         void main() {
             vec4 base = texture(u_base, v_uv);
+            vec4 committed = texture(u_committedBlur, v_uv); // straight RGBA
             vec3 blurredRgb = texture(u_blurred, v_uv).rgb;
             float maskA = texture(u_blurMask, v_uv).a;
-            fragColor = vec4(mix(base.rgb, blurredRgb, maskA), base.a);
+            vec3 afterCommitted = mix(base.rgb, committed.rgb, committed.a);
+            vec3 finalRgb = mix(afterCommitted, blurredRgb, maskA);
+            fragColor = vec4(finalRgb, base.a);
         }
     )";
     if (!blurRevealShader_.compile(R"(#version 300 es
@@ -112,6 +117,51 @@ bool Renderer::init() {
         }
     )", kBlurRevealFs)) {
         PE_LOGE("Renderer: blur reveal shader compile failed");
+        return false;
+    }
+
+    // Bake shader: read the committed layer + current live blurred source +
+    // active stroke mask, write the new committed layer. RGB is a straight
+    // mix at mask alpha (active overwrites committed where the stroke covered
+    // it — last-write-wins, which matches the user's mental model when they
+    // re-stroke over an existing blur with a different strength). Alpha uses
+    // src-over so re-stroking an already-baked area keeps full coverage.
+    static constexpr const char* kBakeBlurFs = R"(#version 300 es
+        precision highp float;
+        uniform sampler2D u_committed;
+        uniform sampler2D u_blurred;
+        uniform sampler2D u_mask;
+        in vec2 v_uv;
+        out vec4 fragColor;
+        void main() {
+            vec4 committed = texture(u_committed, v_uv);
+            vec3 blurredRgb = texture(u_blurred, v_uv).rgb;
+            float maskA = texture(u_mask, v_uv).a;
+            vec3 newRgb = mix(committed.rgb, blurredRgb, maskA);
+            float newA  = maskA + committed.a * (1.0 - maskA);
+            fragColor = vec4(newRgb, newA);
+        }
+    )";
+    if (!bakeBlurShader_.compile(R"(#version 300 es
+        layout(location = 0) in vec2 a_pos;
+        layout(location = 1) in vec2 a_uv;
+        out vec2 v_uv;
+        void main() {
+            v_uv = a_uv;
+            gl_Position = vec4(a_pos, 0.0, 1.0);
+        }
+    )", kBakeBlurFs)) {
+        PE_LOGE("Renderer: bake blur shader compile failed");
+        return false;
+    }
+
+    // Passthrough blit shader for the second half of the bake ping-pong
+    // (scratch → committed) and for restoring undo snapshots into the
+    // committed FBO. Same shader as kPassthroughFragSrc up top, but compiled
+    // separately so the bake / undo paths don't fight with `passthrough_`
+    // for uniform binding state if both happen in the same frame.
+    if (!copyShader_.compile(kVertexSrc, kPassthroughFragSrc)) {
+        PE_LOGE("Renderer: copy shader compile failed");
         return false;
     }
     return true;
@@ -129,7 +179,13 @@ bool Renderer::makeContextCurrent() {
 void Renderer::release() {
     textLayer_.release();
     blurRevealShader_.release();
+    bakeBlurShader_.release();
+    copyShader_.release();
     blurredSource_.release();
+    committedBlurFbo_.release();
+    bakeScratchFbo_.release();
+    undoableCommittedBlur_.clear();
+    redoableCommittedBlur_.clear();
     paintEngine_.release();
     composeShader_.release();
     cropEngine_.release();
@@ -144,6 +200,7 @@ void Renderer::release() {
     filterChainSized_ = false;
     paintEngineSized_ = false;
     blurredSourceSized_ = false;
+    committedBlurSized_ = false;
     textLayerSized_ = false;
     sourceW_ = sourceH_ = 0;
 }
@@ -215,11 +272,44 @@ bool Renderer::setSourceBitmap(const uint8_t* rgba, int width, int height) {
         PE_LOGE("BlurredSource process failed");
         return false;
     }
+
+    // Committed-blur layer + bake ping-pong scratch — both source-res RGBA.
+    // Cleared to (0,0,0,0) so the reveal shader's `mix(base, committed.rgb,
+    // committed.a)` is a no-op for unblurred pixels (committed.a = 0). A new
+    // source bitmap implicitly resets any prior baked blur, which matches
+    // the user's expectation that "load a different photo" starts fresh.
+    if (!committedBlurFbo_.create(width, height)) return false;
+    if (!bakeScratchFbo_.create(width, height))   return false;
+    committedBlurFbo_.bind();
+    glClearColor(0.f, 0.f, 0.f, 0.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    Framebuffer::bindDefault();
+    committedBlurSized_ = true;
+    undoableCommittedBlur_.clear();
+    redoableCommittedBlur_.clear();
     return true;
 }
 
 void Renderer::setFilterParams(const FilterParams& params) {
     filterParams_ = params;
+}
+
+void Renderer::setBlurSigma(float sigma) {
+    // Sigma is interpreted in 1/8-res space inside BlurredSource — the shader
+    // operates on the downsampled copy, so the full-res equivalent is ~8× this
+    // value. Upper bound 4.4 (full-res ≈ 35) obscures text under the brush
+    // without pushing into "smeared paint" territory at the top of the slider.
+    // Lower bound 0.3 (full-res ≈ 2.4) lets the slider start at "barely-
+    // anything" instead of locking the floor at a clearly visible blur —
+    // anything smaller becomes dirac-like noise.
+    if (sigma < 0.3f) sigma = 0.3f;
+    if (sigma > 4.4f) sigma = 4.4f;
+    blurSigma_ = sigma;
+    if (blurredSourceSized_ && sourceTex_.isValid()) {
+        if (!blurredSource_.process(sourceTex_, blurSigma_)) {
+            PE_LOGE("BlurredSource re-process failed at sigma=%f", sigma);
+        }
+    }
 }
 
 void Renderer::setCropParams(const CropParams& params) {
@@ -256,11 +346,11 @@ bool Renderer::exportToBitmap(uint8_t* outRgba, int outWidth, int outHeight) {
     quad_.draw();
     Framebuffer::bindDefault();
 
-    // Blur reveal pass: mix in the pre-blurred source wherever the blur-brush
-    // mask is opaque. Always run — a fully-empty mask is a no-op mix(base, _, 0)
-    // and costs one full-screen quad with three samples per fragment (cheap
-    // compared to the filter chain that just ran). Output lands in
-    // `revealedFbo`, which becomes the texture downstream stages consume.
+    // Blur reveal pass: first layer the committed (baked, per-stroke-sigma)
+    // blur over the composed image, then mix in the active in-progress
+    // stroke using the live `blurredSource_` at the current slider sigma.
+    // Always run — empty layers contribute zero. Output goes to `revealedFbo`,
+    // which becomes the texture downstream stages consume.
     Framebuffer revealedFbo;
     if (!revealedFbo.create(sourceW_, sourceH_)) return false;
     revealedFbo.bind();
@@ -270,9 +360,11 @@ bool Renderer::exportToBitmap(uint8_t* outRgba, int outWidth, int outHeight) {
     composedFbo.texture().bind(GL_TEXTURE0);
     blurredSource_.texture().bind(GL_TEXTURE1);
     paintEngine_.blurMaskTexture().bind(GL_TEXTURE2);
+    committedBlurFbo_.texture().bind(GL_TEXTURE3);
     blurRevealShader_.setInt("u_base", 0);
     blurRevealShader_.setInt("u_blurred", 1);
     blurRevealShader_.setInt("u_blurMask", 2);
+    blurRevealShader_.setInt("u_committedBlur", 3);
     quad_.draw();
     Framebuffer::bindDefault();
 
@@ -325,6 +417,120 @@ bool Renderer::exportToBitmap(uint8_t* outRgba, int outWidth, int outHeight) {
 
     Framebuffer::bindDefault();
     return true;
+}
+
+namespace {
+// Snapshot the colour attachment of `fbo` into a fresh RGBA texture and push
+// it onto `stack`, evicting the oldest entry FIFO-style when the cap is hit.
+// Mirrors PaintEngine::pushSnapshot but lives here so the Renderer's
+// committed-blur undo stack isn't tied to the PaintEngine instance.
+bool snapshotFboTo(Framebuffer& fbo,
+                   std::vector<std::unique_ptr<Texture>>& stack,
+                   size_t cap) {
+    auto snap = std::make_unique<Texture>();
+    if (!snap->createEmpty(fbo.width(), fbo.height())) return false;
+    fbo.bind();
+    glBindTexture(GL_TEXTURE_2D, snap->id());
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, fbo.width(), fbo.height());
+    glBindTexture(GL_TEXTURE_2D, 0);
+    Framebuffer::bindDefault();
+    if (stack.size() >= cap) stack.erase(stack.begin());
+    stack.push_back(std::move(snap));
+    return true;
+}
+} // namespace
+
+void Renderer::commitActiveBlurStroke() {
+    if (!committedBlurSized_) return;
+    if (!paintEngine_.isReady()) return;
+
+    // Ping-pong pass: read (committed, blurred, mask) → write scratch. Can't
+    // sample committed and write to it in the same draw call (undefined per
+    // GLES spec), hence the scratch hop.
+    bakeScratchFbo_.bind();
+    glViewport(0, 0, bakeScratchFbo_.width(), bakeScratchFbo_.height());
+    glClearColor(0.f, 0.f, 0.f, 0.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDisable(GL_BLEND);
+    bakeBlurShader_.use();
+    committedBlurFbo_.texture().bind(GL_TEXTURE0);
+    blurredSource_.texture().bind(GL_TEXTURE1);
+    paintEngine_.blurMaskTexture().bind(GL_TEXTURE2);
+    bakeBlurShader_.setInt("u_committed", 0);
+    bakeBlurShader_.setInt("u_blurred", 1);
+    bakeBlurShader_.setInt("u_mask", 2);
+    quad_.draw();
+
+    // Second pass: blit scratch back into the committed FBO so the next bake
+    // / render sees the up-to-date state at its canonical texture slot.
+    committedBlurFbo_.bind();
+    glViewport(0, 0, committedBlurFbo_.width(), committedBlurFbo_.height());
+    glClearColor(0.f, 0.f, 0.f, 0.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    copyShader_.use();
+    bakeScratchFbo_.texture().bind(GL_TEXTURE0);
+    copyShader_.setInt("u_tex", 0);
+    quad_.draw();
+    Framebuffer::bindDefault();
+
+    // Push the post-bake state to undo. Same FIFO discipline as PaintEngine —
+    // newest = back, oldest evicted from the front. Any pending redo history
+    // gets dropped (a fresh stroke after undo invalidates the redo chain).
+    snapshotFboTo(committedBlurFbo_, undoableCommittedBlur_, kMaxCommittedBlurSnapshots);
+    redoableCommittedBlur_.clear();
+
+    // Mask is no longer needed — the stroke is baked. Leaving it would
+    // double-render the blur on the next frame (mask still opaque → live
+    // blurredSource_ would re-reveal on top of the freshly committed pixels).
+    paintEngine_.clearBlurMask();
+}
+
+void Renderer::undoBlurLayer() {
+    if (!committedBlurSized_) return;
+    if (undoableCommittedBlur_.empty()) return;
+
+    // Same rule as PaintEngine's undo: top-of-undo is the CURRENT state. Move
+    // it to redo, then either restore the now-top (= state before the popped
+    // stroke) or clear the FBO if undo is now empty.
+    redoableCommittedBlur_.push_back(std::move(undoableCommittedBlur_.back()));
+    undoableCommittedBlur_.pop_back();
+
+    committedBlurFbo_.bind();
+    glViewport(0, 0, committedBlurFbo_.width(), committedBlurFbo_.height());
+    glClearColor(0.f, 0.f, 0.f, 0.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (!undoableCommittedBlur_.empty()) {
+        glDisable(GL_BLEND);
+        copyShader_.use();
+        undoableCommittedBlur_.back()->bind(GL_TEXTURE0);
+        copyShader_.setInt("u_tex", 0);
+        quad_.draw();
+    }
+    Framebuffer::bindDefault();
+}
+
+void Renderer::redoBlurLayer() {
+    if (!committedBlurSized_) return;
+    if (redoableCommittedBlur_.empty()) return;
+
+    auto next = std::move(redoableCommittedBlur_.back());
+    redoableCommittedBlur_.pop_back();
+
+    committedBlurFbo_.bind();
+    glViewport(0, 0, committedBlurFbo_.width(), committedBlurFbo_.height());
+    glClearColor(0.f, 0.f, 0.f, 0.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDisable(GL_BLEND);
+    copyShader_.use();
+    next->bind(GL_TEXTURE0);
+    copyShader_.setInt("u_tex", 0);
+    quad_.draw();
+    Framebuffer::bindDefault();
+
+    if (undoableCommittedBlur_.size() >= kMaxCommittedBlurSnapshots) {
+        undoableCommittedBlur_.erase(undoableCommittedBlur_.begin());
+    }
+    undoableCommittedBlur_.push_back(std::move(next));
 }
 
 } // namespace photoedit

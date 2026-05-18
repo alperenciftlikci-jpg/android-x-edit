@@ -12,9 +12,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalInspectionMode
-import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
-import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.NextRenderersFactory
 
 @Composable
 fun rememberExoPlayer(): ExoPlayer {
@@ -25,15 +23,7 @@ fun rememberExoPlayer(): ExoPlayer {
     } else {
         val context = LocalContext.current
         remember {
-            // NextRenderersFactory adds FFmpeg-based software video decoders on top of
-            // DefaultRenderersFactory. EXTENSION_RENDERER_MODE_ON means hardware (MediaCodec)
-            // is tried first; FFmpeg only kicks in when the hardware decoder rejects the
-            // profile (e.g. H.264 Hi10P, HEVC 4:2:2 10-bit) — so normal 8-bit playback
-            // keeps its zero-cost hardware path.
-            val renderersFactory = NextRenderersFactory(context)
-                .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
-                .setEnableDecoderFallback(true)
-            ExoPlayer.Builder(context, renderersFactory).build()
+            ExoPlayer.Builder(context).build()
         }
     }
 }

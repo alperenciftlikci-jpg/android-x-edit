@@ -72,6 +72,24 @@ class PhotoEditorProState {
     }
     val paintStrokesCommitted: SnapshotStateList<Long> = mutableStateListOf()  // colour-brush stroke ids — drives Paint-tab undo + preview re-render
     val blurStrokesCommitted: SnapshotStateList<Long> = mutableStateListOf()   // BlurBrush stroke ids — independent stack for Blur-tab undo
+
+    /** Blur-brush strength as a 0..1 slider value. Mapped to a low-res Gaussian sigma
+     *  in the [0.3, 4.4] range — the native blur runs on a 1/8 downsample so this is
+     *  effectively a full-res sigma of [2.4, 35]. The narrow band keeps the lower
+     *  half of the slider in genuinely subtle territory; the upper end reaches
+     *  ~sigma 35, enough to obscure body text under the brush without crossing
+     *  into "smeared paint" territory. Driven by the Strength slider in the Blur
+     *  tab's brush sub-mode. */
+    var blurBrushStrength: Float by mutableStateOf(0.1f)
+        private set
+    fun updateBlurBrushStrength(v: Float) { blurBrushStrength = v.coerceIn(0f, 1f) }
+    /** Convert the 0..1 strength to the low-res Gaussian sigma the native engine
+     *  expects. Linear interpolation across the [0.3, 4.4] band — at strength 0
+     *  the blur is barely perceptible (full-res sigma ≈ 2.4), at strength 1 it's
+     *  strong enough to obscure text (full-res sigma ≈ 35). User controls the
+     *  intensity themselves via the slider rather than the editor opinionatedly
+     *  picking a heavy default. */
+    val blurBrushSigma: Float get() = 0.3f + blurBrushStrength * 4.1f
     /** Bumped on every paint-stroke pointer sample. Driver for live preview re-renders during
      *  drawing; the screen's snapshotFlow watches this so the user sees their stroke build up
      *  on-canvas in real time, not only after lifting the finger. */
@@ -201,6 +219,7 @@ class PhotoEditorProState {
         paintStrokesCommitted.clear()
         blurStrokesCommitted.clear()
         editingTextId = null
+        blurBrushStrength = 0.1f
     }
 
     enum class Tab { Tune, Effects, Blur, Crop, Paint, Text }

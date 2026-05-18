@@ -24,6 +24,7 @@ out/
 # Gradle files
 .gradle/
 build/
+build.old_*/
 
 # Python cache
 __pycache__/
