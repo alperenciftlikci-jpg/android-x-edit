@@ -10,6 +10,7 @@ package io.element.android.libraries.mediaviewer.impl.local.player
 
 import android.net.Uri
 import androidx.annotation.FloatRange
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.saveable.Saver
 import androidx.compose.ui.Alignment
 
@@ -29,6 +30,7 @@ enum class MiniPlayerCorner {
     }
 }
 
+@Immutable
 data class MediaPlayerControllerState(
     val isVisible: Boolean,
     val isPlaying: Boolean,
@@ -99,8 +101,17 @@ data class MediaPlayerControllerState(
     val displayProgressInMillis: Long
         get() = seekingToMillis ?: progressInMillis
 
-    @FloatRange(from = 0.0, to = 1.0)
-    val progressAsFloat = (displayProgressInMillis.toFloat() / durationInMillis.toFloat()).coerceIn(0f, 1f)
+    /**
+     * `get()` rather than an eagerly-computed `val` so the float-divide only
+     * runs when something reads it. The video path never does (the seek bar
+     * works in long-ms arithmetic) — only [MediaAudioView] consumes it. With
+     * the polling loop firing `state.copy(progressInMillis = …)` ~5×/s, the
+     * eager form was burning a divide + coerceIn on every tick for nothing
+     * on the video side.
+     */
+    @get:FloatRange(from = 0.0, to = 1.0)
+    val progressAsFloat: Float
+        get() = (displayProgressInMillis.toFloat() / durationInMillis.toFloat()).coerceIn(0f, 1f)
 }
 
 /**

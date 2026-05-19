@@ -25,8 +25,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -191,12 +193,87 @@ fun AutoEnterPictureInPictureEffect(
     onSkipForward: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
+    // Memoise the capability lookup. isPictureInPictureSupported walks
+    // PackageManager + reads ActivityInfo — cheap individually, but the
+    // LaunchedEffect that pushes PiP params re-runs on every aspect / hint
+    // / isPlaying change, and the dispose path checks again. Once per
+    // composable lifetime is enough.
+    val pipSupported = remember(context) { isPictureInPictureSupported(context) }
+    val pipActivity = remember(context) { context.findActivity() }
+    // Pre-build the per-action PendingIntents at composable scope. PendingIntents
+    // are immutable + activity-scoped + cached by the system anyway; allocating
+    // 3 Intent + 3 PendingIntent objects per `setPictureInPictureParams` call
+    // was needless garbage (the LaunchedEffect re-fires on every video frame
+    // change of aspect/hint or every play→pause). Building once gives the OS
+    // the same canonical references each fire.
+    val skipBackPi = remember(pipActivity) {
+        pipActivity?.let { buildPipPendingIntent(it, PIP_REQUEST_SKIP_BACK, PIP_ACTION_SKIP_BACK) }
+    }
+    val playPausePi = remember(pipActivity) {
+        pipActivity?.let { buildPipPendingIntent(it, PIP_REQUEST_PLAY_PAUSE, PIP_ACTION_PLAY_PAUSE) }
+    }
+    val skipForwardPi = remember(pipActivity) {
+        pipActivity?.let { buildPipPendingIntent(it, PIP_REQUEST_SKIP_FORWARD, PIP_ACTION_SKIP_FORWARD) }
+    }
+    // Static (non-playing-state-dependent) RemoteActions — Icon, label and
+    // PendingIntent never change for skip-back / skip-forward. Cache so the
+    // params LaunchedEffect only rebuilds the play/pause RemoteAction on
+    // each fire (its icon flips with isPlaying).
+    val skipBackAction = remember(pipActivity, skipBackPi) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && pipActivity != null && skipBackPi != null) {
+            RemoteAction(
+                Icon.createWithResource(
+                    pipActivity,
+                    io.element.android.libraries.mediaviewer.impl.R.drawable.ic_skip_back_10,
+                ),
+                "Skip back 10s",
+                "Skip back 10 seconds",
+                skipBackPi,
+            )
+        } else null
+    }
+    val skipForwardAction = remember(pipActivity, skipForwardPi) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && pipActivity != null && skipForwardPi != null) {
+            RemoteAction(
+                Icon.createWithResource(
+                    pipActivity,
+                    io.element.android.libraries.mediaviewer.impl.R.drawable.ic_skip_forward_10,
+                ),
+                "Skip forward 10s",
+                "Skip forward 10 seconds",
+                skipForwardPi,
+            )
+        } else null
+    }
+    // Last-applied params signature. Compose's effect-key comparison already
+    // dedupes the *common* path, but configuration changes (rotation, theme
+    // switch, etc.) recreate this composable and restart the LaunchedEffect
+    // with the same parameter values — without this cache we'd cross the
+    // binder for an identical params object on every rotation. Cheap string
+    // key, big win when chained with the rotate operation user flagged as
+    // janky.
+    val lastParamsKeyState = remember { mutableStateOf<String?>(null) }
+
+    // Latest-lambda holders so the receiver dispatches to the current
+    // callbacks even though the DisposableEffect below is keyed on nullity
+    // (not identity). The call site passes inline lambdas — each parent
+    // recomposition spawns fresh closure instances; keying the effect on
+    // them directly would unregister + re-register the broadcast receiver
+    // on every state tick (binder IPC + a Context.registerReceiver bookkeeping
+    // pass). Capturing latest refs here lets the effect stay stable.
+    val latestOnPlayPause by rememberUpdatedState(onPlayPause)
+    val latestOnBack by rememberUpdatedState(onBack)
+    val latestOnSkipBack by rememberUpdatedState(onSkipBack)
+    val latestOnSkipForward by rememberUpdatedState(onSkipForward)
 
     // Action receiver: PendingIntents from setActions broadcast into here,
     // we route to the appropriate callback. Registered once per Activity
     // lifetime; the action key inside the intent extras tells us which
     // button the user pressed in the system PiP overlay.
-    DisposableEffect(context, onPlayPause, onBack, onSkipBack, onSkipForward) {
+    DisposableEffect(
+        context,
+        onPlayPause != null, onBack != null, onSkipBack != null, onSkipForward != null,
+    ) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
             (onPlayPause == null && onBack == null && onSkipBack == null && onSkipForward == null)) {
             return@DisposableEffect onDispose { /* nothing to wire */ }
@@ -206,10 +283,10 @@ fun AutoEnterPictureInPictureEffect(
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context?, intent: Intent?) {
                 when (intent?.getStringExtra(PIP_ACTION_KEY)) {
-                    PIP_ACTION_PLAY_PAUSE -> onPlayPause?.invoke()
-                    PIP_ACTION_BACK -> onBack?.invoke()
-                    PIP_ACTION_SKIP_BACK -> onSkipBack?.invoke()
-                    PIP_ACTION_SKIP_FORWARD -> onSkipForward?.invoke()
+                    PIP_ACTION_PLAY_PAUSE -> latestOnPlayPause?.invoke()
+                    PIP_ACTION_BACK -> latestOnBack?.invoke()
+                    PIP_ACTION_SKIP_BACK -> latestOnSkipBack?.invoke()
+                    PIP_ACTION_SKIP_FORWARD -> latestOnSkipForward?.invoke()
                 }
             }
         }
@@ -235,17 +312,39 @@ fun AutoEnterPictureInPictureEffect(
     ) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return@LaunchedEffect
         if (aspectRatio == null) return@LaunchedEffect
-        val activity = context.findActivity() ?: return@LaunchedEffect
-        if (!isPictureInPictureSupported(context)) return@LaunchedEffect
+        val activity = pipActivity ?: return@LaunchedEffect
+        if (!pipSupported) return@LaunchedEffect
+        // Dedupe against the last applied params signature. Rotation
+        // recreates this composable and restarts the effect with the same
+        // values; without this we'd cross the binder for an identical
+        // params object. The key encodes everything the params depend on.
+        val coercedAspect = aspectRatio.coerceToPiPRange()
+        val key = buildString {
+            append(coercedAspect.numerator); append(':'); append(coercedAspect.denominator)
+            append('|'); append(sourceRectHint?.flattenToString())
+            append('|'); append(isPlaying)
+            append('|'); append(onPlayPause != null)
+            append('|'); append(onSkipBack != null)
+            append('|'); append(onSkipForward != null)
+        }
+        if (lastParamsKeyState.value == key) return@LaunchedEffect
         val params = PictureInPictureParams.Builder()
-            .setAspectRatio(aspectRatio.coerceToPiPRange())
+            .setAspectRatio(coercedAspect)
             .setAutoEnterEnabled(true)
             .apply {
                 if (sourceRectHint != null && !sourceRectHint.isEmpty) {
                     setSourceRectHint(sourceRectHint)
                 }
                 val actions = buildPipActions(
-                    activity, isPlaying, onPlayPause, onBack, onSkipBack, onSkipForward,
+                    activity = activity,
+                    isPlaying = isPlaying,
+                    onPlayPause = onPlayPause,
+                    onBack = onBack,
+                    onSkipBack = onSkipBack,
+                    onSkipForward = onSkipForward,
+                    cachedSkipBackAction = skipBackAction,
+                    cachedSkipForwardAction = skipForwardAction,
+                    cachedPlayPausePi = playPausePi,
                 )
                 if (actions.isNotEmpty()) {
                     setActions(actions)
@@ -254,6 +353,7 @@ fun AutoEnterPictureInPictureEffect(
             .build()
         try {
             activity.setPictureInPictureParams(params)
+            lastParamsKeyState.value = key
         } catch (t: Throwable) {
             Timber.w(t, "setPictureInPictureParams failed")
         }
@@ -261,8 +361,8 @@ fun AutoEnterPictureInPictureEffect(
     DisposableEffect(context) {
         onDispose {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return@onDispose
-            val activity = context.findActivity() ?: return@onDispose
-            if (!isPictureInPictureSupported(context)) return@onDispose
+            val activity = pipActivity ?: return@onDispose
+            if (!pipSupported) return@onDispose
             val params = PictureInPictureParams.Builder()
                 .setAutoEnterEnabled(false)
                 .build()
@@ -273,6 +373,21 @@ fun AutoEnterPictureInPictureEffect(
             }
         }
     }
+}
+
+/** Build a broadcast PendingIntent for the PiP action with the given key. */
+@RequiresApi(Build.VERSION_CODES.O)
+private fun buildPipPendingIntent(
+    activity: Activity,
+    requestCode: Int,
+    actionKey: String,
+): PendingIntent {
+    val piFlags = PendingIntent.FLAG_UPDATE_CURRENT or
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_IMMUTABLE else 0
+    val intent = Intent(PIP_ACTION_INTENT)
+        .setPackage(activity.packageName)
+        .putExtra(PIP_ACTION_KEY, actionKey)
+    return PendingIntent.getBroadcast(activity, requestCode, intent, piFlags)
 }
 
 /** Compose-side broadcast intent action + extras the PiP RemoteActions fire. */
@@ -295,40 +410,24 @@ private fun buildPipActions(
     onBack: (() -> Unit)?,
     onSkipBack: (() -> Unit)?,
     onSkipForward: (() -> Unit)?,
+    cachedSkipBackAction: RemoteAction?,
+    cachedSkipForwardAction: RemoteAction?,
+    cachedPlayPausePi: PendingIntent?,
 ): List<RemoteAction> {
     val list = mutableListOf<RemoteAction>()
-    // PendingIntents need FLAG_UPDATE_CURRENT so re-building actions
-    // (play→pause toggle) swaps the underlying intent's icon instead of
-    // re-using the cached stale one. Android 12+ also forces FLAG_IMMUTABLE
-    // for broadcasts.
-    val piFlags = PendingIntent.FLAG_UPDATE_CURRENT or
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_IMMUTABLE else 0
-
     // YouTube-style 3-action layout: skip-back / play-pause / skip-forward.
     // Critical UI reason for filling all three slots: Android shows a
     // centred "[_]" PiP menu hint when the action row has empty slots.
     // Three actions evict that hint entirely and leave a clean
     // skip / play / skip strip in the middle of the PiP window.
-    if (onSkipBack != null) {
-        val intent = Intent(PIP_ACTION_INTENT)
-            .setPackage(activity.packageName)
-            .putExtra(PIP_ACTION_KEY, PIP_ACTION_SKIP_BACK)
-        val pi = PendingIntent.getBroadcast(activity, PIP_REQUEST_SKIP_BACK, intent, piFlags)
-        list += RemoteAction(
-            Icon.createWithResource(
-                activity,
-                io.element.android.libraries.mediaviewer.impl.R.drawable.ic_skip_back_10,
-            ),
-            "Skip back 10s",
-            "Skip back 10 seconds",
-            pi,
-        )
+    //
+    // Skip actions never change shape (icon + label + intent all static),
+    // so they're pre-built at composable scope. Only play/pause is
+    // rebuilt per fire — its icon flips with `isPlaying`.
+    if (onSkipBack != null && cachedSkipBackAction != null) {
+        list += cachedSkipBackAction
     }
-    if (onPlayPause != null) {
-        val intent = Intent(PIP_ACTION_INTENT)
-            .setPackage(activity.packageName)
-            .putExtra(PIP_ACTION_KEY, PIP_ACTION_PLAY_PAUSE)
-        val pi = PendingIntent.getBroadcast(activity, PIP_REQUEST_PLAY_PAUSE, intent, piFlags)
+    if (onPlayPause != null && cachedPlayPausePi != null) {
         val iconRes = if (isPlaying) {
             io.element.android.compound.R.drawable.ic_compound_pause_solid
         } else {
@@ -338,23 +437,11 @@ private fun buildPipActions(
             Icon.createWithResource(activity, iconRes),
             if (isPlaying) "Pause" else "Play",
             if (isPlaying) "Pause video" else "Play video",
-            pi,
+            cachedPlayPausePi,
         )
     }
-    if (onSkipForward != null) {
-        val intent = Intent(PIP_ACTION_INTENT)
-            .setPackage(activity.packageName)
-            .putExtra(PIP_ACTION_KEY, PIP_ACTION_SKIP_FORWARD)
-        val pi = PendingIntent.getBroadcast(activity, PIP_REQUEST_SKIP_FORWARD, intent, piFlags)
-        list += RemoteAction(
-            Icon.createWithResource(
-                activity,
-                io.element.android.libraries.mediaviewer.impl.R.drawable.ic_skip_forward_10,
-            ),
-            "Skip forward 10s",
-            "Skip forward 10 seconds",
-            pi,
-        )
+    if (onSkipForward != null && cachedSkipForwardAction != null) {
+        list += cachedSkipForwardAction
     }
     // `onBack` is intentionally unused here — tapping anywhere in the PiP
     // window already expands back to the activity, so a dedicated back

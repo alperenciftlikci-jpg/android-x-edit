@@ -38,8 +38,9 @@ object FrameSnapshotter {
         videoUri: Uri,
         positionMillis: Long,
         targetAspectRatio: Float? = null,
+        maxDimensionPx: Int? = null,
     ): Uri? = withContext(Dispatchers.IO) {
-        val frame = decodeFrame(context, videoUri, positionMillis) ?: return@withContext null
+        val frame = decodeFrame(context, videoUri, positionMillis, maxDimensionPx) ?: return@withContext null
         try {
             // Respect the resize-mode aspect ratio: if the user is
             // viewing the video in 3:4 / 4:3 / 9:16 / 16:9, the snapshot
@@ -86,20 +87,49 @@ object FrameSnapshotter {
         }
     }
 
-    private fun decodeFrame(context: Context, videoUri: Uri, positionMillis: Long): Bitmap? {
+    private fun decodeFrame(
+        context: Context,
+        videoUri: Uri,
+        positionMillis: Long,
+        maxDimensionPx: Int?,
+    ): Bitmap? {
         val retriever = MediaMetadataRetriever()
         return try {
             retriever.setDataSource(context, videoUri)
+            val timeUs = positionMillis * 1000L
             // OPTION_CLOSEST_SYNC jumps to the nearest keyframe instead of
             // decoding the exact requested frame — 3-5x faster (typically
             // 30-100 ms vs 200-500 ms with OPTION_CLOSEST). The trade-off
             // is the saved frame can be up to a GOP-length off (rarely
             // more than 1-2 s); for a quick "screenshot now" affordance
             // the speed win matters more than millisecond-perfect timing.
-            retriever.getFrameAtTime(
-                positionMillis * 1000L,
-                MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
-            )
+            val option = MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+
+            // 4K-aware fast path: if the video is larger than the device's
+            // long-edge screen pixel count, hand MediaMetadataRetriever a
+            // dst size up front via getScaledFrameAtTime (API 27+) so the
+            // decoder downsamples during decode instead of giving us the
+            // full 3840×2160 ≈ 33 MB ARGB_8888 bitmap that we then crop /
+            // re-encode. Saves ~4–8× peak memory + decode time on 4K
+            // sources. Falls back to getFrameAtTime when there's no
+            // dst-size cap, on API < 27, or when the source already fits
+            // within the cap.
+            val scaledFrame = if (maxDimensionPx != null &&
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                val srcW = retriever.extractMetadata(
+                    MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH
+                )?.toIntOrNull() ?: 0
+                val srcH = retriever.extractMetadata(
+                    MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT
+                )?.toIntOrNull() ?: 0
+                if (srcW > 0 && srcH > 0 && (srcW > maxDimensionPx || srcH > maxDimensionPx)) {
+                    val scale = maxDimensionPx.toFloat() / maxOf(srcW, srcH).toFloat()
+                    val dstW = (srcW * scale).toInt().coerceAtLeast(1)
+                    val dstH = (srcH * scale).toInt().coerceAtLeast(1)
+                    retriever.getScaledFrameAtTime(timeUs, option, dstW, dstH)
+                } else null
+            } else null
+            scaledFrame ?: retriever.getFrameAtTime(timeUs, option)
         } catch (t: Throwable) {
             Timber.e(t, "FrameSnapshotter: getFrameAtTime failed")
             null

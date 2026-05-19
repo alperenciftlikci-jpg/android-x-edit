@@ -143,11 +143,21 @@ fun MediaPlayerControllerView(
                             )
                         }
                     }
+                    // Memoise the formatted progress string — the polling
+                    // loop ticks 5x/s and toHumanReadableDuration is a
+                    // String concatenation + locale-aware DurationFormatter
+                    // call on every tick. remember() ensures we only
+                    // re-format when the underlying ms actually changes,
+                    // and within a second we typically tick the same ms
+                    // bucket once (5 × 200 ms vs 1 s string resolution).
+                    val formattedProgress = remember(state.displayProgressInMillis) {
+                        state.displayProgressInMillis.toHumanReadableDuration()
+                    }
                     Text(
                         modifier = Modifier
                             .widthIn(min = 48.dp)
                             .padding(horizontal = 8.dp),
-                        text = state.displayProgressInMillis.toHumanReadableDuration(),
+                        text = formattedProgress,
                         textAlign = TextAlign.Center,
                         color = ElementTheme.colors.textPrimary,
                         style = ElementTheme.typography.fontBodyXsMedium,

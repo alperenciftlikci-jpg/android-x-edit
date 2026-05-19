@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Copyright (c) 2026 Element Creations Ltd.
+    SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial.
+
+    Snapshot button icon — camera inside four corner viewfinder brackets.
+    Combines two semantics in one glyph: "take a photo" (camera body + lens)
+    and "capture the current frame" (brackets read as a viewfinder / scanner
+    crosshair). Better fit for a video player snapshot affordance than the
+    plain camera icon, which reads as "take a new photo" rather than "grab
+    this frame".
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <!-- 4 L-shaped corner brackets, separate paths so each gets its own
+         rounded line caps. -->
+    <path
+        android:strokeColor="#FF000000"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M3.5,9 V5.5 Q3.5,3.5 5.5,3.5 H9" />
+    <path
+        android:strokeColor="#FF000000"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M15,3.5 H18.5 Q20.5,3.5 20.5,5.5 V9" />
+    <path
+        android:strokeColor="#FF000000"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M20.5,15 V18.5 Q20.5,20.5 18.5,20.5 H15" />
+    <path
+        android:strokeColor="#FF000000"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M9,20.5 H5.5 Q3.5,20.5 3.5,18.5 V15" />
+
+    <!-- Camera body: outlined rounded rectangle with a small viewfinder
+         notch on top. -->
+    <path
+        android:strokeColor="#FF000000"
+        android:strokeWidth="1.6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M8.5,10.5 L9.5,9 H14.5 L15.5,10.5 H17 Q17.5,10.5 17.5,11 V16 Q17.5,16.5 17,16.5 H7 Q6.5,16.5 6.5,16 V11 Q6.5,10.5 7,10.5 Z" />
+
+    <!-- Lens: outer ring outlined, small filled dot in the middle. -->
+    <path
+        android:strokeColor="#FF000000"
+        android:strokeWidth="1.4"
+        android:pathData="M12,13.5 m-1.6,0 a1.6,1.6 0,1 0,3.2 0 a1.6,1.6 0,1 0,-3.2 0" />
+</vector>

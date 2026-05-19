@@ -11,7 +11,7 @@ package io.element.android.libraries.mediaviewer.impl.local.video
 import android.annotation.SuppressLint
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
-import android.media.MediaActionSound
+import android.view.LayoutInflater
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.widget.FrameLayout
 import androidx.annotation.OptIn
@@ -62,6 +62,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalInspectionMode
@@ -113,6 +114,15 @@ import kotlinx.coroutines.delay
 import me.saket.telephoto.zoomable.zoomable
 import timber.log.Timber
 import kotlin.time.Duration.Companion.seconds
+
+/**
+ * Minimum milliseconds between consecutive `exoPlayer.seekTo` calls while the
+ * user is dragging the in-app mini-player scrub bar. 50 ms ≈ 20 Hz which is
+ * Telegram / YouTube-class smoothness without overwhelming the decoder. UI
+ * state still updates on every touch event — only the player-side seek is
+ * throttled.
+ */
+private const val SCRUB_SEEK_INTERVAL_MS = 50L
 
 @SuppressLint("UnsafeOptInUsageError")
 @Composable
@@ -370,24 +380,10 @@ private fun ExoPlayerMediaVideoView(
     val coroutineScope = rememberCoroutineScope()
     val isInAppPiP = mediaPlayerControllerState.isInAppPiP
 
-    // Pre-loaded shutter-click sound for snapshot feedback. Wrapping
-    // in remember + DisposableEffect guarantees:
-    //   - the AssetFileDescriptor for the sound is opened once (not
-    //     once per snapshot — the first play() would otherwise have
-    //     a ~50 ms first-shot delay while it loads from /system/media)
-    //   - the underlying SoundPool is freed when the composable goes
-    //     away (release() is documented as mandatory or the native
-    //     buffers leak across activity restarts).
-    // Using MediaActionSound.SHUTTER_CLICK because:
-    //   - it's the OS-canonical shutter sound; behaves identically
-    //     across vendors / themes (matches user's phone camera);
-    //   - the OS automatically honours regional shutter-mute rules
-    //     (some markets like JP/KR force the sound on for privacy
-    //     reasons even when the user has muted system sounds).
-    val shutterSound = remember { MediaActionSound().apply { load(MediaActionSound.SHUTTER_CLICK) } }
-    DisposableEffect(shutterSound) {
-        onDispose { shutterSound.release() }
-    }
+    // Snapshot is intentionally silent — the visible thumbnail flight
+    // animation + "Galeriye kaydedildi" toast give clear feedback. The
+    // earlier MediaActionSound.SHUTTER_CLICK path was removed because the
+    // user explicitly preferred no audio cue.
 
     // Two-phase snapshot feedback animation:
     //   1. Thumbnail preview pops in (centred-bottom of the video),
@@ -455,11 +451,26 @@ private fun ExoPlayerMediaVideoView(
         }
     }
 
+    // Cache animation specs once — AnimatedVisibility otherwise allocates a
+    // fresh EnterTransition / ExitTransition tree on every recomposition, and
+    // the surrounding view recomposes at the polling cadence (5 Hz during
+    // playback). Tiny per-recomp cost, but accumulates to thousands of small
+    // garbage objects per minute of playback.
+    val thumbnailEnter = remember { fadeIn() + slideInVertically { it / 2 } }
+    val thumbnailExit = remember { fadeOut() + slideOutVertically { it * 2 } }
+    val toastEnter = remember { slideInVertically { it } + fadeIn() }
+    val toastExit = remember { slideOutVertically { it } + fadeOut() }
+
     BoxWithConstraints(
         modifier = modifier
             .background(ElementTheme.colors.bgSubtlePrimary),
     ) {
         val context = LocalContext.current
+        // findActivity walks the ContextWrapper chain — cheap but allocates
+        // on every call. Cached here so the Rotate onClick (and any other
+        // future activity-reaching action) reuses the same reference instead
+        // of re-walking each tap.
+        val cachedActivity = remember(context) { context.findActivity() }
         // Parent dimensions captured here drive the snap-to-corner logic
         // when the user drops a dragged mini player; without knowing the
         // outer Box's bounds we'd have to guess at which corner is closest.
@@ -668,20 +679,53 @@ private fun ExoPlayerMediaVideoView(
                     }
                 AndroidView(
                     modifier = androidViewModifier,
-                    factory = {
-                        PlayerView(context).apply {
+                    factory = { ctx ->
+                        // Inflate from XML so we can set surface_type="texture_view"
+                        // (constructor-only attribute on PlayerView). Why TextureView
+                        // here: SurfaceView lives on a separate hardware-composited
+                        // layer (HWC plane / hardware overlay). When the activity
+                        // rotates, the compositing path switches from hardware
+                        // overlay → GPU compositing → back to hardware overlay,
+                        // and the two paths have slightly different color matrices
+                        // (YUV→RGB conversion + gamma). The result: black pixels
+                        // stay black (any path maps 0→0) but mid-tones / saturated
+                        // colours pop a touch lighter for a frame or two during
+                        // the rotate animation — what users see as the brief
+                        // "renkler az açılıyor" flash. TextureView always renders
+                        // through GPU compositing, so there's no path-switch and
+                        // no flash. Trade-off: ~5-10 % extra CPU/GPU per frame
+                        // (one additional texture copy). Acceptable for this
+                        // viewer; we don't ship DRM and the per-frame cost is
+                        // unnoticeable on modern devices.
+                        val view = LayoutInflater.from(ctx)
+                            .inflate(
+                                io.element.android.libraries.mediaviewer.impl.R.layout.player_view_texture,
+                                null,
+                            ) as PlayerView
+                        view.apply {
                             player = exoPlayer
                             layoutParams = FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
                             useController = false
                         }
                     },
                     update = { playerView ->
-                        playerView.resizeMode = if (isInAppPiP) {
+                        // Equality-gate both writes — AndroidView.update runs
+                        // on every recomposition (5×/s during playback) and
+                        // both setters cross the AndroidX → Media3 boundary
+                        // with extra work (resizeMode triggers a layout pass;
+                        // useController re-binds controller listeners). Skip
+                        // the assignment when nothing actually changed.
+                        val targetResize = if (isInAppPiP) {
                             androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
                         } else {
                             mediaPlayerControllerState.resizeMode.toExo()
                         }
-                        playerView.useController = false
+                        if (playerView.resizeMode != targetResize) {
+                            playerView.resizeMode = targetResize
+                        }
+                        if (playerView.useController) {
+                            playerView.useController = false
+                        }
                     },
                     onRelease = { playerView ->
                         playerView.player = null
@@ -689,249 +733,75 @@ private fun ExoPlayerMediaVideoView(
                 )
                 // Thin red progress bar at the bottom of the video — only
                 // when in system PiP. Activity layout is captured into the
-                // PiP window, so anything painted inside this Box shows
-                // up there. Lets the user see playback position at a
-                // glance inside the small PiP window, just like YouTube.
-                // Skipped outside PiP (in-app mini has its own seekable
-                // bar; the fullscreen MediaPlayerControllerView slider is
-                // the seek affordance there — adding a duplicate would
-                // just sit below the slider as visual noise, which is
-                // exactly the bug the user spotted).
+                // PiP window so anything painted inside this Box shows up
+                // there. In-app mini has its own seekable bar; fullscreen
+                // shows the controller's slider — so this bar is exclusive
+                // to system PiP mode.
                 if (mediaPlayerControllerState.isInPictureInPicture) {
-                    val fsDuration = mediaPlayerControllerState.durationInMillis
-                    val fsProgress = if (fsDuration > 0L) {
-                        (mediaPlayerControllerState.displayProgressInMillis.toFloat() / fsDuration.toFloat())
-                            .coerceIn(0f, 1f)
-                    } else {
-                        0f
-                    }
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.BottomStart)
-                            .fillMaxWidth(fsProgress)
-                            .height(2.dp)
-                            .background(Color.Red),
+                    SystemPipProgressBar(
+                        durationInMillis = mediaPlayerControllerState.durationInMillis,
+                        progressInMillis = mediaPlayerControllerState.displayProgressInMillis,
+                        modifier = Modifier.align(Alignment.BottomStart),
                     )
                 }
                 if (isInAppPiP) {
-                    // Mini overlay controls — in-app mini only. System PiP
-                    // used to render these too for visual consistency, but
-                    // the user found it confusing (the buttons look
-                    // tappable but Android intercepts touches in PiP
-                    // and turns every tap into "expand back to app"). For
-                    // system PiP we rely on the bottom-row RemoteActions
-                    // instead — same compound icons, actually functional.
-                    Box(modifier = Modifier.fillMaxSize()) {
-                        // Centered play/pause — bigger tap target than the
-                        // 36 dp main controller version so it stays usable
-                        // at mini size.
-                        Box(
-                            modifier = Modifier
-                                .align(Alignment.Center)
-                                .size(44.dp)
-                                .background(Color.Black.copy(alpha = 0.55f), CircleShape)
-                                .clip(CircleShape)
-                                .clickable { exoPlayer.togglePlay() }
-                                .padding(10.dp),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Icon(
-                                imageVector = if (mediaPlayerControllerState.isPlaying) {
-                                    CompoundIcons.PauseSolid()
-                                } else {
-                                    CompoundIcons.PlaySolid()
-                                },
-                                tint = Color.White,
-                                contentDescription = if (mediaPlayerControllerState.isPlaying) "Pause" else "Play",
+                    InAppMiniOverlay(
+                        exoPlayer = exoPlayer,
+                        isPlaying = mediaPlayerControllerState.isPlaying,
+                        durationInMillis = mediaPlayerControllerState.durationInMillis,
+                        displayProgressInMillis = mediaPlayerControllerState.displayProgressInMillis,
+                        onTogglePlay = { exoPlayer.togglePlay() },
+                        onDismissMini = {
+                            mediaPlayerControllerState = mediaPlayerControllerState.copy(
+                                isInAppPiP = false,
+                                isVisible = true,
                             )
-                        }
-                        // Top-right: dismiss the mini.
-                        IconButton(
-                            modifier = Modifier
-                                .align(Alignment.TopEnd)
-                                .padding(4.dp)
-                                .size(30.dp),
-                            onClick = {
-                                Timber.d("[mini-pip] Close button clicked | isPlaying=%s playWhenReady=%s",
-                                    exoPlayer.isPlaying, exoPlayer.playWhenReady)
-                                mediaPlayerControllerState = mediaPlayerControllerState.copy(
-                                    isInAppPiP = false,
-                                    isVisible = true,
-                                )
-                            },
-                        ) {
-                            Icon(
-                                imageVector = CompoundIcons.Close(),
-                                tint = Color.White,
-                                contentDescription = "Close",
+                        },
+                        onSeekingToChange = { ms ->
+                            mediaPlayerControllerState = mediaPlayerControllerState.copy(
+                                seekingToMillis = ms,
                             )
-                        }
-                        // Top-left: expand back to fullscreen. Same action
-                        // as Close in our context (the host screen IS the
-                        // fullscreen player) but kept separate for the
-                        // affordance — the icon explicitly says "expand".
-                        IconButton(
-                            modifier = Modifier
-                                .align(Alignment.TopStart)
-                                .padding(4.dp)
-                                .size(30.dp),
-                            onClick = {
-                                Timber.d("[mini-pip] Expand button clicked | isPlaying=%s playWhenReady=%s",
-                                    exoPlayer.isPlaying, exoPlayer.playWhenReady)
-                                mediaPlayerControllerState = mediaPlayerControllerState.copy(
-                                    isInAppPiP = false,
-                                    isVisible = true,
-                                )
-                            },
-                        ) {
-                            Icon(
-                                imageVector = CompoundIcons.Expand(),
-                                tint = Color.White,
-                                contentDescription = "Expand to fullscreen",
-                            )
-                        }
-                    }
-                    // YouTube-style thin red progress bar with a draggable
-                    // thumb. Outer Box is 16 dp tall (comfortable touch
-                    // target), painted bar 2 dp (YouTube thickness), and a
-                    // 12 dp white circle thumb sits centred on the bar at
-                    // the current progress position.
-                    //
-                    // Reading `displayProgressInMillis` (= seekingToMillis
-                    // ?: progressInMillis) instead of progressInMillis so
-                    // the bar + thumb visually track the user's finger
-                    // mid-scrub. With raw progressInMillis the polling
-                    // loop only updates on playback ticks, so during a
-                    // drag the thumb appeared frozen at the start point.
-                    val duration = mediaPlayerControllerState.durationInMillis
-                    val progress = if (duration > 0L) {
-                        (mediaPlayerControllerState.displayProgressInMillis.toFloat() / duration.toFloat())
-                            .coerceIn(0f, 1f)
-                    } else {
-                        0f
-                    }
-                    BoxWithConstraints(
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .fillMaxWidth()
-                            .height(16.dp)
-                            .pointerInput(duration) {
-                                if (duration <= 0L) return@pointerInput
-                                awaitEachGesture {
-                                    val down = awaitFirstDown(requireUnconsumed = false)
-                                    down.consume()
-                                    // Pause while scrubbing — the user is
-                                    // hunting for a frame, not watching.
-                                    // The previous code called
-                                    // seekToEnsurePlaying which forced
-                                    // play() on every position change,
-                                    // making the video stutter forward
-                                    // mid-drag. Capture the prior intent
-                                    // and restore it on release.
-                                    val wasPlaying = exoPlayer.playWhenReady
-                                    if (wasPlaying) exoPlayer.pause()
-                                    val width = size.width.toFloat()
-                                    val initial = (down.position.x / width).coerceIn(0f, 1f)
-                                    val initialMs = (initial * duration).toLong()
-                                    exoPlayer.seekTo(initialMs)
-                                    mediaPlayerControllerState =
-                                        mediaPlayerControllerState.copy(seekingToMillis = initialMs)
-                                    while (true) {
-                                        val event = awaitPointerEvent()
-                                        val change = event.changes.firstOrNull() ?: break
-                                        if (!change.pressed) break
-                                        change.consume()
-                                        val frac = (change.position.x / width).coerceIn(0f, 1f)
-                                        val ms = (frac * duration).toLong()
-                                        exoPlayer.seekTo(ms)
-                                        mediaPlayerControllerState =
-                                            mediaPlayerControllerState.copy(seekingToMillis = ms)
-                                    }
-                                    if (wasPlaying) exoPlayer.play()
-                                }
-                            },
-                    ) {
-                        val barWidthPx = constraints.maxWidth.toFloat()
-                        val thumbSize = 12.dp
-                        val thumbSizePx = with(LocalDensity.current) { thumbSize.toPx() }
-                        // Dim background track (full width).
-                        Box(
-                            modifier = Modifier
-                                .align(Alignment.Center)
-                                .fillMaxWidth()
-                                .height(2.dp)
-                                .background(Color.Red.copy(alpha = 0.35f)),
-                        )
-                        // Filled portion up to current progress.
-                        Box(
-                            modifier = Modifier
-                                .align(Alignment.CenterStart)
-                                .fillMaxWidth(progress)
-                                .height(2.dp)
-                                .background(Color.Red),
-                        )
-                        // Thumb circle at the progress point. Vertically
-                        // centred so the thumb sits ON the bar; the
-                        // CenterStart alignment + x-offset places it
-                        // horizontally at `progress * width`.
-                        val thumbXPx = (barWidthPx * progress - thumbSizePx / 2f)
-                            .coerceIn(0f, barWidthPx - thumbSizePx)
-                        Box(
-                            modifier = Modifier
-                                .align(Alignment.CenterStart)
-                                .offset { IntOffset(thumbXPx.toInt(), 0) }
-                                .size(thumbSize)
-                                .background(Color.White, CircleShape),
-                        )
-                    }
+                        },
+                    )
                 }
             }
         }
         // Top-end snapshot capture button — reachable even when the
-        // bottom controller bar is hidden. Mirrors a stock camera-shutter
-        // affordance: filled photo icon, becomes a small progress
-        // indicator while the frame is being grabbed + written to disk.
-        // Hidden inside in-app mini and system PiP (no use for it
-        // there).
+        // bottom controller bar is hidden. Hidden in mini / system PiP.
         if (mediaPlayerControllerState.canCaptureFrame &&
             !mediaPlayerControllerState.isInAppPiP &&
             !mediaPlayerControllerState.isInPictureInPicture) {
-            IconButton(
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(12.dp)
-                    .size(40.dp)
-                    .background(Color.Black.copy(alpha = 0.45f), CircleShape),
+            SnapshotTopEndButton(
+                isCapturing = mediaPlayerControllerState.isCapturingFrame,
+                modifier = Modifier.align(Alignment.TopEnd),
                 onClick = {
                     autoHideController++
-                    val uri = localMedia?.uri ?: return@IconButton
-                    if (mediaPlayerControllerState.isCapturingFrame) return@IconButton
-                    // Fire the shutter sound the moment the user taps —
-                    // gives audible feedback even if the actual decode
-                    // takes a beat. Same UX timing as native phone
-                    // cameras (sound at button-press, photo arrives a
-                    // frame or two later).
-                    shutterSound.play(MediaActionSound.SHUTTER_CLICK)
+                    val uri = localMedia?.uri ?: return@SnapshotTopEndButton
+                    if (mediaPlayerControllerState.isCapturingFrame) return@SnapshotTopEndButton
                     val captureAt = exoPlayer.currentPosition
                     val targetAspect = mediaPlayerControllerState.resizeMode.aspectRatio
+                    // Cap snapshot decode resolution to the device's long-edge
+                    // pixel count. FrameSnapshotter routes through
+                    // getScaledFrameAtTime on API 27+ when the cap matters.
+                    val displayMetrics = context.resources.displayMetrics
+                    val maxDimensionPx = maxOf(displayMetrics.widthPixels, displayMetrics.heightPixels)
                     mediaPlayerControllerState =
                         mediaPlayerControllerState.copy(isCapturingFrame = true)
                     coroutineScope.launch {
-                        val out = FrameSnapshotter.capture(context, uri, captureAt, targetAspect)
+                        val out = FrameSnapshotter.capture(
+                            context = context,
+                            videoUri = uri,
+                            positionMillis = captureAt,
+                            targetAspectRatio = targetAspect,
+                            maxDimensionPx = maxDimensionPx,
+                        )
                         Timber.d("FrameSnapshotter result: %s", out)
                         if (out != null) {
-                            // Success path — kick off the thumbnail →
-                            // "Galeriye kaydedildi" toast sequence via the
-                            // existing LaunchedEffect keyed on lastSnapshotUri.
                             mediaPlayerControllerState = mediaPlayerControllerState.copy(
                                 isCapturingFrame = false,
                                 lastSnapshotUri = out,
                             )
                         } else {
-                            // Failure path — DRM-protected, audio-only,
-                            // codec rejected the frame request. Show the
-                            // user a clear error toast and let it auto-
-                            // dismiss after a couple of seconds.
                             mediaPlayerControllerState = mediaPlayerControllerState.copy(
                                 isCapturingFrame = false,
                             )
@@ -941,131 +811,30 @@ private fun ExoPlayerMediaVideoView(
                         }
                     }
                 },
-                enabled = !mediaPlayerControllerState.isCapturingFrame,
-            ) {
-                if (mediaPlayerControllerState.isCapturingFrame) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(20.dp),
-                        color = Color.White,
-                        strokeWidth = 2.dp,
-                    )
-                } else {
-                    Icon(
-                        imageVector = CompoundIcons.TakePhotoSolid(),
-                        tint = Color.White,
-                        contentDescription = "Take snapshot",
-                    )
-                }
-            }
+            )
         }
         // Resize-mode toast — centred over the video, fades in/out for
         // ~1.5 s after the user cycles the resize button so they know
         // which mode they just switched to (e.g. "3:4", "Orijinal").
-        AnimatedVisibility(
-            visible = resizeModeToast != null,
+        ResizeModeToast(
+            label = resizeModeToast,
             modifier = Modifier.align(Alignment.Center),
-            enter = fadeIn(),
-            exit = fadeOut(),
-        ) {
-            val label = resizeModeToast
-            if (label != null) {
-                Box(
-                    modifier = Modifier
-                        .shadow(4.dp, RoundedCornerShape(20.dp))
-                        .clip(RoundedCornerShape(20.dp))
-                        .background(Color.Black.copy(alpha = 0.75f))
-                        .padding(horizontal = 20.dp, vertical = 12.dp),
-                ) {
-                    Text(text = label, color = Color.White)
-                }
-            }
-        }
-        // Phase 1 — snapshot thumbnail preview. Pops in centred-bottom
-        // when a snapshot lands, sits visible briefly, then slides down
-        // off-screen via the exit animation. Backed by the in-flight
-        // `lastSnapshotUri` so it renders the actual just-captured frame.
-        AnimatedVisibility(
-            visible = thumbnailVisible,
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = (bottomPaddingInPixels.toDp() + 96.dp)),
-            enter = fadeIn() + slideInVertically { it / 2 },
-            exit = fadeOut() + slideOutVertically { it * 2 },
-        ) {
-            val snapUri = mediaPlayerControllerState.lastSnapshotUri
-            if (snapUri != null) {
-                // Use the saved snapshot's actual aspect ratio for the
-                // preview so the thumbnail looks like a miniature of the
-                // real image (not a forced square that crops content).
-                // resize-mode aspect when one is set; otherwise the
-                // native video aspect ExoPlayer last reported.
-                val previewAspect = mediaPlayerControllerState.resizeMode.aspectRatio
-                    ?: videoAspectRatio?.let { it.numerator.toFloat() / it.denominator }
-                    ?: (16f / 9f)
-                AsyncImage(
-                    model = snapUri,
-                    contentDescription = "Snapshot preview",
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier
-                        .height(80.dp)
-                        .aspectRatio(previewAspect)
-                        .shadow(6.dp, RoundedCornerShape(10.dp))
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(Color.Black),
-                )
-            }
-        }
-        // Phase 2 — "Galeriye kaydedildi" toast. Slides up from the
-        // bottom after the thumbnail has finished its exit animation
-        // (sequencing handled by the LaunchedEffect above), sits for
-        // ~1.6 s, slides back out.
-        AnimatedVisibility(
-            visible = savedToastVisible,
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = (bottomPaddingInPixels.toDp() + 96.dp)),
-            enter = slideInVertically { it } + fadeIn(),
-            exit = slideOutVertically { it } + fadeOut(),
-        ) {
-            Box(
-                modifier = Modifier
-                    .shadow(4.dp, RoundedCornerShape(20.dp))
-                    .clip(RoundedCornerShape(20.dp))
-                    .background(Color.Black.copy(alpha = 0.85f))
-                    .padding(horizontal = 16.dp, vertical = 10.dp),
-            ) {
-                Text(
-                    text = "Galeriye kaydedildi",
-                    color = Color.White,
-                )
-            }
-        }
-        // Snapshot error toast — fired when capture returns null (DRM
-        // stream, audio-only, decoder failure). Same visual treatment
-        // as the success toast so the error feels native to the
-        // animation system, just with red-ish background to signal
-        // the failure.
-        AnimatedVisibility(
-            visible = snapshotErrorVisible,
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = (bottomPaddingInPixels.toDp() + 96.dp)),
-            enter = slideInVertically { it } + fadeIn(),
-            exit = slideOutVertically { it } + fadeOut(),
-        ) {
-            Box(
-                modifier = Modifier
-                    .shadow(4.dp, RoundedCornerShape(20.dp))
-                    .clip(RoundedCornerShape(20.dp))
-                    .background(Color(0xFFB00020).copy(alpha = 0.9f))
-                    .padding(horizontal = 16.dp, vertical = 10.dp),
-            ) {
-                Text(
-                    text = "Görüntü alınamadı",
-                    color = Color.White,
-                )
-            }
-        }
+        )
+        SnapshotFeedbackOverlay(
+            thumbnailVisible = thumbnailVisible,
+            savedToastVisible = savedToastVisible,
+            errorVisible = snapshotErrorVisible,
+            snapshotUri = mediaPlayerControllerState.lastSnapshotUri,
+            previewAspectRatio = mediaPlayerControllerState.resizeMode.aspectRatio
+                ?: videoAspectRatio?.let { it.numerator.toFloat() / it.denominator }
+                ?: (16f / 9f),
+            bottomPaddingDp = bottomPaddingInPixels.toDp() + 96.dp,
+            thumbnailEnter = thumbnailEnter,
+            thumbnailExit = thumbnailExit,
+            toastEnter = toastEnter,
+            toastExit = toastExit,
+            modifier = Modifier.align(Alignment.BottomCenter),
+        )
         // MediaPlayerControllerView stays mounted even when the in-app mini
         // player is active — it just hides itself visually via its own
         // AnimatedVisibility on state.isVisible (we set isVisible=false when
@@ -1127,7 +896,7 @@ private fun ExoPlayerMediaVideoView(
                 },
                 onRotate = {
                     autoHideController++
-                    val activity = context.findActivity() ?: return@MediaPlayerControllerView
+                    val activity = cachedActivity ?: return@MediaPlayerControllerView
                     // 4-state 90° clockwise cycle:
                     //   PORTRAIT → LANDSCAPE → REVERSE_PORTRAIT → REVERSE_LANDSCAPE
                     // Using explicit (non-SENSOR) orientations means the
@@ -1204,7 +973,16 @@ private fun ExoPlayerMediaVideoView(
                     progressInMillis = position,
                     seekingToMillis = if (seekingTo != null && position >= seekingTo) null else seekingTo,
                 )
-                delay(200)
+                // Throttle the poll to 1 Hz when nothing visible is consuming
+                // the progress value (controller bar hidden AND not in either
+                // PiP mode — both PiP variants paint their own live progress).
+                // 5 Hz is what the visible slider needs to feel smooth; at 1
+                // Hz the only consumer is the saved-position state, so the
+                // extra ticks are pure recomposition cost.
+                val needsHighFreq = mediaPlayerControllerState.isVisible ||
+                    mediaPlayerControllerState.isInPictureInPicture ||
+                    mediaPlayerControllerState.isInAppPiP
+                delay(if (needsHighFreq) 200L else 1000L)
             }
         } else {
             // Ensure we render the final state
@@ -1224,25 +1002,6 @@ private fun ExoPlayerMediaVideoView(
         playerListener = playerListener,
         mediaPlayerControllerState = mediaPlayerControllerState,
     )
-}
-
-/**
- * Top-left pixel coordinates of a mini-player anchored at the given corner,
- * inside a parent of the given pixel dimensions. Used by the drag handler to
- * compute the mini's absolute position after a drop and pick the nearest
- * destination corner.
- */
-private fun cornerBaseTopLeft(
-    corner: MiniPlayerCorner,
-    parentW: Float,
-    parentH: Float,
-    miniW: Float,
-    miniH: Float,
-): Offset = when (corner) {
-    MiniPlayerCorner.TOP_START -> Offset(0f, 0f)
-    MiniPlayerCorner.TOP_END -> Offset(parentW - miniW, 0f)
-    MiniPlayerCorner.BOTTOM_START -> Offset(0f, parentH - miniH)
-    MiniPlayerCorner.BOTTOM_END -> Offset(parentW - miniW, parentH - miniH)
 }
 
 @OptIn(UnstableApi::class)
@@ -1317,6 +1076,362 @@ private fun ExoPlayerLifecycleHelper(
     OnLifecycleEvent { _, event ->
         if (event == Lifecycle.Event.ON_STOP && exoPlayer.isPlaying) {
             exoPlayer.pause()
+        }
+    }
+}
+
+/**
+ * In-app mini player overlay: centre play/pause, top-right close, top-left
+ * expand, plus the YouTube-style draggable scrub bar at the bottom. The
+ * whole subtree lives in a single composable so polling-tick recompositions
+ * stay scoped here rather than re-evaluating the rest of the player UI.
+ *
+ * `exoPlayer` is passed through (not callbacks) for two reasons: the scrub
+ * gesture reads `playWhenReady` to decide whether to resume after release,
+ * and the throttled seek loop calls `seekTo` directly. Hoisting all that
+ * state to the parent via 5+ callbacks would be more code without changing
+ * the coupling — the mini overlay is intrinsically a player UI.
+ */
+@OptIn(UnstableApi::class)
+@Composable
+private fun InAppMiniOverlay(
+    exoPlayer: ExoPlayer,
+    isPlaying: Boolean,
+    durationInMillis: Long,
+    displayProgressInMillis: Long,
+    onTogglePlay: () -> Unit,
+    onDismissMini: () -> Unit,
+    onSeekingToChange: (Long?) -> Unit,
+) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        // Centred play/pause — bigger tap target than the 36 dp main
+        // controller version so it stays usable at mini size.
+        Box(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .size(44.dp)
+                .background(Color.Black.copy(alpha = 0.55f), CircleShape)
+                .clip(CircleShape)
+                .clickable { onTogglePlay() }
+                .padding(10.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = if (isPlaying) CompoundIcons.PauseSolid() else CompoundIcons.PlaySolid(),
+                tint = Color.White,
+                contentDescription = if (isPlaying) "Pause" else "Play",
+            )
+        }
+        // Top-right: dismiss the mini.
+        IconButton(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(4.dp)
+                .size(30.dp),
+            onClick = {
+                Timber.d("[mini-pip] Close button clicked | isPlaying=%s playWhenReady=%s",
+                    exoPlayer.isPlaying, exoPlayer.playWhenReady)
+                onDismissMini()
+            },
+        ) {
+            Icon(
+                imageVector = CompoundIcons.Close(),
+                tint = Color.White,
+                contentDescription = "Close",
+            )
+        }
+        // Top-left: expand back to fullscreen — same effect as Close in
+        // our screen layout (the host IS the fullscreen player), kept
+        // separate for icon affordance.
+        IconButton(
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(4.dp)
+                .size(30.dp),
+            onClick = {
+                Timber.d("[mini-pip] Expand button clicked | isPlaying=%s playWhenReady=%s",
+                    exoPlayer.isPlaying, exoPlayer.playWhenReady)
+                onDismissMini()
+            },
+        ) {
+            Icon(
+                imageVector = CompoundIcons.Expand(),
+                tint = Color.White,
+                contentDescription = "Expand to fullscreen",
+            )
+        }
+        // YouTube-style scrub bar with draggable thumb. 16 dp tall outer
+        // box for the touch target, 2 dp painted track, 12 dp thumb.
+        // Reading `displayProgressInMillis` (= seekingToMillis ?:
+        // progressInMillis) so the thumb tracks the user's finger mid-
+        // scrub instead of waiting for the next polling tick to land.
+        val progress = if (durationInMillis > 0L) {
+            (displayProgressInMillis.toFloat() / durationInMillis.toFloat()).coerceIn(0f, 1f)
+        } else 0f
+        // Box (not BoxWithConstraints) + onSizeChanged: SubcomposeLayout
+        // is heavier and we only need a single pixel width for thumb math.
+        var scrubBarWidthPx by remember { mutableIntStateOf(0) }
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .height(16.dp)
+                .onSizeChanged { scrubBarWidthPx = it.width }
+                .pointerInput(durationInMillis) {
+                    if (durationInMillis <= 0L) return@pointerInput
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        down.consume()
+                        // Pause while scrubbing — the user is hunting for
+                        // a frame, not watching. Capture the prior intent
+                        // so we resume only if they were already playing.
+                        val wasPlaying = exoPlayer.playWhenReady
+                        if (wasPlaying) exoPlayer.pause()
+                        val width = size.width.toFloat()
+                        val initial = (down.position.x / width).coerceIn(0f, 1f)
+                        val initialMs = (initial * durationInMillis).toLong()
+                        exoPlayer.seekTo(initialMs)
+                        onSeekingToChange(initialMs)
+                        // Throttle exoPlayer.seekTo to SCRUB_SEEK_INTERVAL_MS.
+                        // Touch events at 60-120 Hz would otherwise flush
+                        // the decoder pipeline on every move. UI state
+                        // still updates per-event for thumb tracking.
+                        var lastSeekUptimeMs = android.os.SystemClock.uptimeMillis()
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull() ?: break
+                            val frac = (change.position.x / width).coerceIn(0f, 1f)
+                            val ms = (frac * durationInMillis).toLong()
+                            onSeekingToChange(ms)
+                            if (!change.pressed) {
+                                // Release — always flush the final seek.
+                                exoPlayer.seekTo(ms)
+                                break
+                            }
+                            change.consume()
+                            val now = android.os.SystemClock.uptimeMillis()
+                            if (now - lastSeekUptimeMs >= SCRUB_SEEK_INTERVAL_MS) {
+                                exoPlayer.seekTo(ms)
+                                lastSeekUptimeMs = now
+                            }
+                        }
+                        if (wasPlaying) exoPlayer.play()
+                    }
+                },
+        ) {
+            val barWidthPx = scrubBarWidthPx.toFloat()
+            val thumbSize = 12.dp
+            val thumbSizePx = with(LocalDensity.current) { thumbSize.toPx() }
+            // Dim background track (full width).
+            Box(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .fillMaxWidth()
+                    .height(2.dp)
+                    .background(Color.Red.copy(alpha = 0.35f)),
+            )
+            // Filled portion up to current progress.
+            Box(
+                modifier = Modifier
+                    .align(Alignment.CenterStart)
+                    .fillMaxWidth(progress)
+                    .height(2.dp)
+                    .background(Color.Red),
+            )
+            // Thumb circle. Guard the first-frame case where onSizeChanged
+            // hasn't fired yet (barWidthPx = 0) — coerceIn(min, max) throws
+            // when min > max, and `barWidthPx - thumbSizePx` is negative
+            // until the bar is measured.
+            if (barWidthPx > thumbSizePx) {
+                val thumbXPx = (barWidthPx * progress - thumbSizePx / 2f)
+                    .coerceIn(0f, barWidthPx - thumbSizePx)
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.CenterStart)
+                        .offset { IntOffset(thumbXPx.toInt(), 0) }
+                        .size(thumbSize)
+                        .background(Color.White, CircleShape),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Thin red progress bar painted at the bottom of the player surface while
+ * system PiP is active. Only the small fraction-of-width Box recomposes on
+ * each polling tick — the parent body and its sibling overlays don't enter
+ * this composable's scope.
+ */
+@Composable
+private fun SystemPipProgressBar(
+    durationInMillis: Long,
+    progressInMillis: Long,
+    modifier: Modifier = Modifier,
+) {
+    val progress = if (durationInMillis > 0L) {
+        (progressInMillis.toFloat() / durationInMillis.toFloat()).coerceIn(0f, 1f)
+    } else 0f
+    Box(
+        modifier = modifier
+            .fillMaxWidth(progress)
+            .height(2.dp)
+            .background(Color.Red),
+    )
+}
+
+/**
+ * Top-end snapshot button. Switches between the camera icon and a spinner
+ * while the capture pipeline is running. Stable-input child — recomposes
+ * only when `isCapturing` flips (snapshot start / finish), skipped on
+ * polling ticks.
+ */
+@Composable
+private fun SnapshotTopEndButton(
+    isCapturing: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    IconButton(
+        modifier = modifier
+            .padding(12.dp)
+            .size(40.dp)
+            .background(Color.Black.copy(alpha = 0.45f), CircleShape),
+        onClick = onClick,
+        enabled = !isCapturing,
+    ) {
+        if (isCapturing) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(20.dp),
+                color = Color.White,
+                strokeWidth = 2.dp,
+            )
+        } else {
+            Icon(
+                resourceId = io.element.android.libraries.mediaviewer.impl.R.drawable.ic_snapshot_capture,
+                tint = Color.White,
+                contentDescription = "Take snapshot",
+            )
+        }
+    }
+}
+
+/**
+ * Two-phase snapshot feedback (thumbnail flight then saved-toast) plus the
+ * error toast. All three AnimatedVisibility blocks share the bottom-centre
+ * anchor + bottom padding; bundling them here keeps the parent body clean
+ * and gives Compose a single skip-able recompose scope for the snapshot
+ * feedback UI (polling ticks don't change any of these inputs, so the
+ * whole subtree is skipped 5×/s during playback).
+ */
+@Composable
+private fun SnapshotFeedbackOverlay(
+    thumbnailVisible: Boolean,
+    savedToastVisible: Boolean,
+    errorVisible: Boolean,
+    snapshotUri: android.net.Uri?,
+    previewAspectRatio: Float,
+    bottomPaddingDp: androidx.compose.ui.unit.Dp,
+    thumbnailEnter: androidx.compose.animation.EnterTransition,
+    thumbnailExit: androidx.compose.animation.ExitTransition,
+    toastEnter: androidx.compose.animation.EnterTransition,
+    toastExit: androidx.compose.animation.ExitTransition,
+    modifier: Modifier = Modifier,
+) {
+    Box(modifier = modifier.fillMaxSize()) {
+        // Phase 1 — thumbnail of the just-captured frame.
+        AnimatedVisibility(
+            visible = thumbnailVisible,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = bottomPaddingDp),
+            enter = thumbnailEnter,
+            exit = thumbnailExit,
+        ) {
+            if (snapshotUri != null) {
+                AsyncImage(
+                    model = snapshotUri,
+                    contentDescription = "Snapshot preview",
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier
+                        .height(80.dp)
+                        .aspectRatio(previewAspectRatio)
+                        .shadow(6.dp, RoundedCornerShape(10.dp))
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Color.Black),
+                )
+            }
+        }
+        // Phase 2 — "saved" toast (Turkish copy).
+        AnimatedVisibility(
+            visible = savedToastVisible,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = bottomPaddingDp),
+            enter = toastEnter,
+            exit = toastExit,
+        ) {
+            Box(
+                modifier = Modifier
+                    .shadow(4.dp, RoundedCornerShape(20.dp))
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(Color.Black.copy(alpha = 0.85f))
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+            ) {
+                Text(text = "Galeriye kaydedildi", color = Color.White)
+            }
+        }
+        // Error toast — capture returned null (DRM, audio-only, decoder
+        // hiccup). Red background so the failure reads as different from
+        // the success copy without changing animation behaviour.
+        AnimatedVisibility(
+            visible = errorVisible,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = bottomPaddingDp),
+            enter = toastEnter,
+            exit = toastExit,
+        ) {
+            Box(
+                modifier = Modifier
+                    .shadow(4.dp, RoundedCornerShape(20.dp))
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(Color(0xFFB00020).copy(alpha = 0.9f))
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+            ) {
+                Text(text = "Görüntü alınamadı", color = Color.White)
+            }
+        }
+    }
+}
+
+/**
+ * Centred mode-name toast ("Orijinal", "3:4", …) that surfaces briefly when
+ * the user cycles the resize button. Skips recomposition on polling ticks
+ * because its only input is a String — strong-skipping treats it as stable
+ * and the value only changes on resize-mode events.
+ */
+@Composable
+private fun ResizeModeToast(
+    label: String?,
+    modifier: Modifier = Modifier,
+) {
+    AnimatedVisibility(
+        visible = label != null,
+        modifier = modifier,
+        enter = fadeIn(),
+        exit = fadeOut(),
+    ) {
+        if (label != null) {
+            Box(
+                modifier = Modifier
+                    .shadow(4.dp, RoundedCornerShape(20.dp))
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(Color.Black.copy(alpha = 0.75f))
+                    .padding(horizontal = 20.dp, vertical = 12.dp),
+            ) {
+                Text(text = label, color = Color.White)
+            }
         }
     }
 }

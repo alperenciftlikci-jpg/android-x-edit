@@ -61,7 +61,10 @@
       "PowerShell($env:JAVA_HOME = \"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; $env:Path = \"$env:JAVA_HOME\\\\bin;$env:Path\"; ./gradlew :app:assembleGplayDebug 2>&1 | Select-Object -Last 8)",
       "PowerShell($env:JAVA_HOME = \"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; $env:Path = \"$env:JAVA_HOME\\\\bin;$env:Path\"; ./gradlew :app:assembleGplayDebug 2>&1 | Select-Object -Last 6)",
       "PowerShell($env:JAVA_HOME = \"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; $env:Path = \"$env:JAVA_HOME\\\\bin;$env:Path\"; ./gradlew :app:packageGplayDebug 2>&1 | Select-Object -Last 6)",
-      "PowerShell($env:JAVA_HOME = \"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; $env:Path = \"$env:JAVA_HOME\\\\bin;$env:Path\"; ./gradlew :app:packageGplayDebug --stacktrace 2>&1 | Tee-Object \"pkg-err.log\" | Out-Null; \\(Get-Content \"pkg-err.log\" -Raw -Encoding Unicode\\) -split \"`r?`n\" | Where-Object { $_ -match \"Caused by|AccessDenied|FileAlready\" } | Select-Object -First 8)"
+      "PowerShell($env:JAVA_HOME = \"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; $env:Path = \"$env:JAVA_HOME\\\\bin;$env:Path\"; ./gradlew :app:packageGplayDebug --stacktrace 2>&1 | Tee-Object \"pkg-err.log\" | Out-Null; \\(Get-Content \"pkg-err.log\" -Raw -Encoding Unicode\\) -split \"`r?`n\" | Where-Object { $_ -match \"Caused by|AccessDenied|FileAlready\" } | Select-Object -First 8)",
+      "Bash(./gradlew :libraries:mediaviewer:impl:compileGplayDebugKotlin --no-daemon --offline)",
+      "Bash(./gradlew :libraries:mediaviewer:impl:tasks --no-daemon --offline)",
+      "Bash(./gradlew :libraries:mediaviewer:impl:compileDebugKotlin --no-daemon --offline)"
     ]
   }
 }

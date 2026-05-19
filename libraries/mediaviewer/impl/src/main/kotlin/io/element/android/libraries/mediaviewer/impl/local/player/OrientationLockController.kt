@@ -11,9 +11,9 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
+import androidx.activity.compose.LocalActivity
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.ui.platform.LocalContext
 
 /**
  * Lock the host Activity's orientation to whatever the screen is currently
@@ -28,9 +28,12 @@ import androidx.compose.ui.platform.LocalContext
  */
 @Composable
 fun OrientationLockEffect(locked: Boolean) {
-    val context = LocalContext.current
+    // LocalActivity (activity-compose 1.10+) gives us the host Activity
+    // directly, no ContextWrapper-walk required. The walker still lives in
+    // findActivity() below because other call sites depend on it from
+    // non-composable code paths.
+    val activity = LocalActivity.current
     DisposableEffect(locked) {
-        val activity = context.findActivity()
         if (locked && activity != null) {
             // Only force SCREEN_ORIENTATION_LOCKED if the activity is
             // currently in a sensor-driven mode. If the user just hit
