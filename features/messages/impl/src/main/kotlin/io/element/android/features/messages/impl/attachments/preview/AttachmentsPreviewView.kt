@@ -8,6 +8,10 @@
 
 package io.element.android.features.messages.impl.attachments.preview
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
+import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -22,6 +26,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.setValue
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
@@ -178,9 +186,17 @@ fun AttachmentsPreviewView(
         postCancel()
     }
 
+    // Strip non-video chrome while the OS has us in PiP — the system
+    // captures the whole activity, so any header / composer that's still
+    // visible at PiP entry ends up inside the PiP window alongside the
+    // video. Hiding both leaves just the video player, matching the
+    // in-app mini player look-and-feel.
+    val isInPip = rememberIsInPictureInPicture()
+
     Scaffold(
         modifier = modifier,
         topBar = {
+            if (isInPip) return@Scaffold
             TopAppBar(
                 navigationIcon = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -263,6 +279,7 @@ fun AttachmentsPreviewView(
             state = state,
             localMediaRenderer = localMediaRenderer,
             onSendClick = ::postSendAttachment,
+            isInPip = isInPip,
         )
     }
     AttachmentSendStateView(
@@ -314,6 +331,7 @@ private fun AttachmentPreviewContent(
     localMediaRenderer: LocalMediaRenderer,
     onSendClick: () -> Unit,
     modifier: Modifier = Modifier,
+    isInPip: Boolean = false,
 ) {
     Column(
         modifier = modifier
@@ -374,10 +392,12 @@ private fun AttachmentPreviewContent(
             }
         }
         val mimeType = (state.attachment as? Attachment.Media)?.localMedia?.info?.mimeType
-        if (mimeType?.isMimeTypeImage() == true) {
-            ImageOptimizationSelector(state.mediaOptimizationSelectorState)
-        } else if (mimeType?.isMimeTypeVideo() == true) {
-            VideoPresetSelector(state = state.mediaOptimizationSelectorState)
+        if (!isInPip) {
+            if (mimeType?.isMimeTypeImage() == true) {
+                ImageOptimizationSelector(state.mediaOptimizationSelectorState)
+            } else if (mimeType?.isMimeTypeVideo() == true) {
+                VideoPresetSelector(state = state.mediaOptimizationSelectorState)
+            }
         }
 
         val sizeFormatter = rememberFileSizeFormatter()
@@ -393,15 +413,17 @@ private fun AttachmentPreviewContent(
             }
         }
 
-        AttachmentsPreviewBottomActions(
-            state = state,
-            onSendClick = onSendClick,
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(ElementTheme.colors.bgCanvasDefault)
-                .height(IntrinsicSize.Min)
-                .imePadding(),
-        )
+        if (!isInPip) {
+            AttachmentsPreviewBottomActions(
+                state = state,
+                onSendClick = onSendClick,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(ElementTheme.colors.bgCanvasDefault)
+                    .height(IntrinsicSize.Min)
+                    .imePadding(),
+            )
+        }
     }
 }
 
@@ -541,6 +563,54 @@ private fun VideoQualitySelectorDialog(
             }
         }
     }
+}
+
+/**
+ * Inline mini-observer of the host Activity's PiP state. Used to strip
+ * the composer + top bar from this screen while the OS has us in PiP —
+ * without this guard, the user's PiP window shows the message composer
+ * squashed alongside the video, instead of the clean floating video the
+ * in-app mini player gives them.
+ *
+ * Kept local to this file (rather than pulling in :libraries:mediaviewer:impl)
+ * because messages:impl only depends on the mediaviewer api module, and
+ * adding the heavier impl dep just for this one bool would inflate the
+ * module graph more than the duplication does.
+ */
+@Composable
+private fun rememberIsInPictureInPicture(): Boolean {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var isInPiP by remember { mutableStateOf(false) }
+    DisposableEffect(lifecycleOwner) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            onDispose { /* PiP unsupported */ }
+        } else {
+            val activity = context.findActivity()
+            if (activity == null) {
+                onDispose { /* no activity to observe */ }
+            } else {
+                isInPiP = activity.isInPictureInPictureMode
+                // PiP entry / exit always fires on the activity's lifecycle
+                // (ON_PAUSE on entry, ON_RESUME on expand-back), so polling
+                // isInPictureInPictureMode at every transition catches both
+                // directions without needing the androidx.activity-specific
+                // PictureInPictureModeChangedInfo listener API.
+                val observer = LifecycleEventObserver { _, _ ->
+                    isInPiP = activity.isInPictureInPictureMode
+                }
+                lifecycleOwner.lifecycle.addObserver(observer)
+                onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+            }
+        }
+    }
+    return isInPiP
+}
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
 }
 
 @Composable
