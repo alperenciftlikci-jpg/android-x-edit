@@ -10,6 +10,7 @@ package io.element.android.libraries.mediaviewer.impl.local.player
 
 import android.net.Uri
 import androidx.annotation.FloatRange
+import androidx.compose.runtime.saveable.Saver
 import androidx.compose.ui.Alignment
 
 /**
@@ -101,3 +102,58 @@ data class MediaPlayerControllerState(
     @FloatRange(from = 0.0, to = 1.0)
     val progressAsFloat = (displayProgressInMillis.toFloat() / durationInMillis.toFloat()).coerceIn(0f, 1f)
 }
+
+/**
+ * `rememberSaveable`-compatible Saver that survives configuration changes
+ * (rotation, theme switch, locale, …) and process death. Only persists the
+ * fields the user can plausibly change AND would expect to come back:
+ * playback position, resize mode, playback speed, orientation lock, mini
+ * player corner, and the in-app PiP active flag.
+ *
+ * Runtime-only fields (isPlaying, isReady, isMuted, durationInMillis,
+ * isCapturingFrame, isInPictureInPicture, lastSnapshotUri, …) are NOT
+ * saved — they're recomputed from the player / system once the screen
+ * comes back, and persisting them would cause stale UI (e.g. showing a
+ * "saving snapshot" spinner forever after a restore mid-capture).
+ *
+ * Keeping the serialised list ordered + tagged with enum-name strings
+ * (instead of ordinals) means renaming an enum constant stays a
+ * compile-time problem; reordering it doesn't silently corrupt restored
+ * state from older app sessions.
+ */
+val MediaPlayerControllerStateSaver: Saver<MediaPlayerControllerState, List<Any?>> =
+    Saver(
+        save = { state ->
+            listOf(
+                state.progressInMillis,
+                state.resizeMode.name,
+                state.playbackSpeed,
+                state.isOrientationLocked,
+                state.miniPlayerCorner.name,
+                state.isInAppPiP,
+            )
+        },
+        restore = { list ->
+            MediaPlayerControllerState(
+                isVisible = true,
+                isPlaying = false,
+                isReady = false,
+                progressInMillis = list[0] as Long,
+                durationInMillis = 0L,
+                canMute = true,
+                isMuted = false,
+                seekingToMillis = null,
+                resizeMode = VideoResizeMode.valueOf(list[1] as String),
+                playbackSpeed = list[2] as Float,
+                isOrientationLocked = list[3] as Boolean,
+                canCaptureFrame = false,
+                isCapturingFrame = false,
+                canEnterPictureInPicture = false,
+                isInPictureInPicture = false,
+                isInAppPiP = list[5] as Boolean,
+                miniPlayerCorner = MiniPlayerCorner.valueOf(list[4] as String),
+                miniControlsVisible = true,
+                lastSnapshotUri = null,
+            )
+        },
+    )

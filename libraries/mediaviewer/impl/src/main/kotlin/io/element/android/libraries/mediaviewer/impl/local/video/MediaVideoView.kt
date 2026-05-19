@@ -11,6 +11,7 @@ package io.element.android.libraries.mediaviewer.impl.local.video
 import android.annotation.SuppressLint
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
+import android.media.MediaActionSound
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.widget.FrameLayout
 import androidx.annotation.OptIn
@@ -28,6 +29,7 @@ import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -43,10 +45,12 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -91,6 +95,7 @@ import io.element.android.libraries.mediaviewer.impl.local.player.DEFAULT_PLAYBA
 import io.element.android.libraries.mediaviewer.impl.local.player.AutoEnterPictureInPictureEffect
 import io.element.android.libraries.mediaviewer.impl.local.player.FrameSnapshotter
 import io.element.android.libraries.mediaviewer.impl.local.player.MediaPlayerControllerState
+import io.element.android.libraries.mediaviewer.impl.local.player.MediaPlayerControllerStateSaver
 import io.element.android.libraries.mediaviewer.impl.local.player.MediaPlayerControllerView
 import io.element.android.libraries.mediaviewer.impl.local.player.MiniPlayerCorner
 import io.element.android.libraries.mediaviewer.impl.local.player.findActivity
@@ -146,7 +151,15 @@ private fun ExoPlayerMediaVideoView(
     modifier: Modifier = Modifier,
 ) {
     val pipState = rememberPictureInPictureState()
-    var mediaPlayerControllerState: MediaPlayerControllerState by remember {
+    // rememberSaveable + custom Saver: survives rotation, multi-window
+    // resize, and process death. Position, resize mode, playback speed,
+    // orientation lock, mini corner + in-app PiP flag are persisted;
+    // ephemeral fields (isPlaying, isReady, canCaptureFrame, …) are
+    // reinitialised from the player / props on restore. See
+    // MediaPlayerControllerStateSaver for the field list rationale.
+    var mediaPlayerControllerState: MediaPlayerControllerState by rememberSaveable(
+        stateSaver = MediaPlayerControllerStateSaver,
+    ) {
         mutableStateOf(
             MediaPlayerControllerState(
                 isVisible = true,
@@ -167,6 +180,21 @@ private fun ExoPlayerMediaVideoView(
             )
         )
     }
+    // One-shot seek-to-saved-position on restore. Fires when the player
+    // first becomes READY after a restore that carried a non-zero
+    // progress. Without this the saved position is just a stored number
+    // that never makes it into ExoPlayer — the UI bar would reflect the
+    // old position but the actual playback would restart from 0.
+    var didRestoreSeek by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(mediaPlayerControllerState.isReady) {
+        if (!didRestoreSeek &&
+            mediaPlayerControllerState.isReady &&
+            mediaPlayerControllerState.progressInMillis > 0L
+        ) {
+            exoPlayer.seekTo(mediaPlayerControllerState.progressInMillis)
+            didRestoreSeek = true
+        }
+    }
     // Keep PiP capability flag in state in sync with the system / activity manifest
     // — recomposition-cheap derive rather than copy-and-assign in init, because
     // pipState.available can flip if the user grants/revokes permissions live.
@@ -176,19 +204,25 @@ private fun ExoPlayerMediaVideoView(
             isInPictureInPicture = pipState.isInPiP.value,
         )
     }
-    // Snapshot button visibility tracks whether we have a URI to capture from
-    // — image-only items pass null, and the controller bar hides the button.
-    LaunchedEffect(localMedia?.uri) {
-        mediaPlayerControllerState = mediaPlayerControllerState.copy(
-            canCaptureFrame = localMedia?.uri != null,
-        )
-    }
-
     // Current video aspect ratio for system PiP auto-enter. Populated by the
     // player listener (added below) as soon as the first onVideoSizeChanged
     // fires; passed to AutoEnterPictureInPictureEffect so Android 12+ has
     // the right aspect ready when the user backgrounds the app.
     var videoAspectRatio by remember { mutableStateOf<android.util.Rational?>(null) }
+
+    // Snapshot button visibility — gated on three things:
+    //   1. We have a URI to capture from (image-only items pass null).
+    //   2. The stream actually has a video track (videoAspectRatio
+    //      stays null for audio-only files; snapshotting an audio
+    //      stream returns a black frame at best, MediaMetadataRetriever
+    //      null at worst).
+    //   3. (Implicit) We aren't already mid-capture — handled at the
+    //      button onClick site.
+    LaunchedEffect(localMedia?.uri, videoAspectRatio) {
+        mediaPlayerControllerState = mediaPlayerControllerState.copy(
+            canCaptureFrame = localMedia?.uri != null && videoAspectRatio != null,
+        )
+    }
     // Video player's on-screen rect — captured via onGloballyPositioned on
     // the PlayerView's AndroidView wrapper. Passed as `sourceRectHint` so
     // system PiP zooms to just the video area instead of the whole
@@ -336,6 +370,25 @@ private fun ExoPlayerMediaVideoView(
     val coroutineScope = rememberCoroutineScope()
     val isInAppPiP = mediaPlayerControllerState.isInAppPiP
 
+    // Pre-loaded shutter-click sound for snapshot feedback. Wrapping
+    // in remember + DisposableEffect guarantees:
+    //   - the AssetFileDescriptor for the sound is opened once (not
+    //     once per snapshot — the first play() would otherwise have
+    //     a ~50 ms first-shot delay while it loads from /system/media)
+    //   - the underlying SoundPool is freed when the composable goes
+    //     away (release() is documented as mandatory or the native
+    //     buffers leak across activity restarts).
+    // Using MediaActionSound.SHUTTER_CLICK because:
+    //   - it's the OS-canonical shutter sound; behaves identically
+    //     across vendors / themes (matches user's phone camera);
+    //   - the OS automatically honours regional shutter-mute rules
+    //     (some markets like JP/KR force the sound on for privacy
+    //     reasons even when the user has muted system sounds).
+    val shutterSound = remember { MediaActionSound().apply { load(MediaActionSound.SHUTTER_CLICK) } }
+    DisposableEffect(shutterSound) {
+        onDispose { shutterSound.release() }
+    }
+
     // Two-phase snapshot feedback animation:
     //   1. Thumbnail preview pops in (centred-bottom of the video),
     //      sits visible for ~1 s, then slides down off-screen.
@@ -346,6 +399,13 @@ private fun ExoPlayerMediaVideoView(
     // animation restarts the sequence cleanly.
     var thumbnailVisible by remember { mutableStateOf(false) }
     var savedToastVisible by remember { mutableStateOf(false) }
+    // Error toast for snapshot failures — DRM-protected streams return a
+    // null bitmap from MediaMetadataRetriever, audio-only streams have
+    // no frame to extract, decoder hiccups on weird codecs. Surfaced as
+    // a bottom toast so the user gets a clear "failed" signal instead
+    // of staring at the spinner waiting for a thumbnail that never
+    // arrives.
+    var snapshotErrorVisible by remember { mutableStateOf(false) }
     LaunchedEffect(mediaPlayerControllerState.lastSnapshotUri) {
         if (mediaPlayerControllerState.lastSnapshotUri != null) {
             savedToastVisible = false   // reset if a second snap happens fast
@@ -433,7 +493,12 @@ private fun ExoPlayerMediaVideoView(
             // the offset-modifier layer instead of the whole MediaVideoView.
             // Reading it up here would cause the BoxWithConstraints body to
             // recompose on every finger move — that was the jitter source.
-            var miniScale by remember { mutableStateOf(1f) }
+            // mutableFloatStateOf avoids the Float→java.lang.Float boxing
+            // that mutableStateOf<Float> would incur on every pinch
+            // delta — pinch fires ~60 times/s, so the GC pressure from
+            // those allocations is real (≈ a couple hundred extra heap
+            // objects per second of two-finger scaling).
+            var miniScale by remember { mutableFloatStateOf(1f) }
             var miniPosPx by remember { mutableStateOf<Offset?>(null) }
 
             // Mini-mode local state belongs to mini mode only — reset it
@@ -547,15 +612,26 @@ private fun ExoPlayerMediaVideoView(
                 } else {
                     val aspect = mediaPlayerControllerState.resizeMode.aspectRatio
                     val baseModifier = if (aspect != null) {
-                        // Centred vertically inside the parent fillMaxSize
-                        // Box. Without this the aspect-constrained
-                        // container glued to the top of the screen and
-                        // left a big black gap below, which the user
-                        // spotted in 16:9 / 4:3 modes.
+                        // Pick the fill direction based on how the target
+                        // aspect compares to the actual parent shape.
+                        // Always `fillMaxWidth().aspectRatio(...)` was
+                        // wrong in landscape: a 9:16 forced ratio with a
+                        // very wide parent computed a height that fell
+                        // outside the parent (and overflowed onto the
+                        // composer / chrome behind the player). Picking
+                        // by axis guarantees the constrained container
+                        // stays inside parent bounds in either rotation.
+                        val parentAspect =
+                            if (parentHeightPx > 0f) parentWidthPx / parentHeightPx else 0f
+                        val constrainByHeight = aspect <= parentAspect
+                        val sizingModifier = if (constrainByHeight) {
+                            Modifier.fillMaxHeight().aspectRatio(aspect)
+                        } else {
+                            Modifier.fillMaxWidth().aspectRatio(aspect)
+                        }
                         Modifier
                             .align(Alignment.Center)
-                            .fillMaxWidth()
-                            .aspectRatio(aspect)
+                            .then(sizingModifier)
                     } else {
                         Modifier.fillMaxSize()
                     }
@@ -570,18 +646,25 @@ private fun ExoPlayerMediaVideoView(
                     )
                 }
                     .onGloballyPositioned { coords ->
-                        // Update the system PiP source-rect hint on every
-                        // layout pass so a rotation / split-screen change
-                        // keeps the rect accurate. boundsInWindow gives the
-                        // PlayerView's absolute window coords, which is
-                        // exactly what setSourceRectHint expects.
+                        // Refresh the system-PiP source-rect hint, but
+                        // only when the bounds actually changed.
+                        // onGloballyPositioned fires once per layout
+                        // pass, and during an orientation cycle that's
+                        // dozens of frames in quick succession — each
+                        // bounds write triggered the AutoEnterPiP
+                        // LaunchedEffect to re-cross the binder with
+                        // setPictureInPictureParams (a non-trivial IPC).
+                        // Equality short-circuit makes rotate snappy.
                         val r = coords.boundsInWindow()
-                        videoBoundsInWindow = android.graphics.Rect(
+                        val next = android.graphics.Rect(
                             r.left.toInt(),
                             r.top.toInt(),
                             r.right.toInt(),
                             r.bottom.toInt(),
                         )
+                        if (next != videoBoundsInWindow) {
+                            videoBoundsInWindow = next
+                        }
                     }
                 AndroidView(
                     modifier = androidViewModifier,
@@ -823,6 +906,12 @@ private fun ExoPlayerMediaVideoView(
                     autoHideController++
                     val uri = localMedia?.uri ?: return@IconButton
                     if (mediaPlayerControllerState.isCapturingFrame) return@IconButton
+                    // Fire the shutter sound the moment the user taps —
+                    // gives audible feedback even if the actual decode
+                    // takes a beat. Same UX timing as native phone
+                    // cameras (sound at button-press, photo arrives a
+                    // frame or two later).
+                    shutterSound.play(MediaActionSound.SHUTTER_CLICK)
                     val captureAt = exoPlayer.currentPosition
                     val targetAspect = mediaPlayerControllerState.resizeMode.aspectRatio
                     mediaPlayerControllerState =
@@ -830,10 +919,26 @@ private fun ExoPlayerMediaVideoView(
                     coroutineScope.launch {
                         val out = FrameSnapshotter.capture(context, uri, captureAt, targetAspect)
                         Timber.d("FrameSnapshotter result: %s", out)
-                        mediaPlayerControllerState = mediaPlayerControllerState.copy(
-                            isCapturingFrame = false,
-                            lastSnapshotUri = out,
-                        )
+                        if (out != null) {
+                            // Success path — kick off the thumbnail →
+                            // "Galeriye kaydedildi" toast sequence via the
+                            // existing LaunchedEffect keyed on lastSnapshotUri.
+                            mediaPlayerControllerState = mediaPlayerControllerState.copy(
+                                isCapturingFrame = false,
+                                lastSnapshotUri = out,
+                            )
+                        } else {
+                            // Failure path — DRM-protected, audio-only,
+                            // codec rejected the frame request. Show the
+                            // user a clear error toast and let it auto-
+                            // dismiss after a couple of seconds.
+                            mediaPlayerControllerState = mediaPlayerControllerState.copy(
+                                isCapturingFrame = false,
+                            )
+                            snapshotErrorVisible = true
+                            delay(2200)
+                            snapshotErrorVisible = false
+                        }
                     }
                 },
                 enabled = !mediaPlayerControllerState.isCapturingFrame,
@@ -931,6 +1036,32 @@ private fun ExoPlayerMediaVideoView(
             ) {
                 Text(
                     text = "Galeriye kaydedildi",
+                    color = Color.White,
+                )
+            }
+        }
+        // Snapshot error toast — fired when capture returns null (DRM
+        // stream, audio-only, decoder failure). Same visual treatment
+        // as the success toast so the error feels native to the
+        // animation system, just with red-ish background to signal
+        // the failure.
+        AnimatedVisibility(
+            visible = snapshotErrorVisible,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = (bottomPaddingInPixels.toDp() + 96.dp)),
+            enter = slideInVertically { it } + fadeIn(),
+            exit = slideOutVertically { it } + fadeOut(),
+        ) {
+            Box(
+                modifier = Modifier
+                    .shadow(4.dp, RoundedCornerShape(20.dp))
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(Color(0xFFB00020).copy(alpha = 0.9f))
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+            ) {
+                Text(
+                    text = "Görüntü alınamadı",
                     color = Color.White,
                 )
             }
@@ -1123,7 +1254,14 @@ private fun ExoPlayerLifecycleHelper(
     playerListener: Player.Listener,
     mediaPlayerControllerState: MediaPlayerControllerState,
 ) {
-    // Prepare and release the exoPlayer with the composable lifecycle
+    // Prepare and release the exoPlayer with the composable lifecycle.
+    // The composable-scope release covers the common path (navigation
+    // away from the player screen disposes the composable, which
+    // releases). The lifecycle-scope release below covers the edge case
+    // where the composable stays mounted in a Compose-nav back stack
+    // while the host Activity is being destroyed — without the second
+    // hook the player would survive into onDestroy holding decoder /
+    // codec resources until the GC eventually swept it up.
     DisposableEffect(Unit) {
         Timber.d("ExoPlayerMediaVideoView DisposableEffect: initializing exoPlayer")
         exoPlayer.addListener(playerListener)
@@ -1136,6 +1274,24 @@ private fun ExoPlayerLifecycleHelper(
                 exoPlayer.release()
             }
         }
+    }
+
+    // Activity-lifecycle-scoped release safety net. On ON_DESTROY we
+    // tear the player down even if the composable hasn't been disposed
+    // yet (Compose nav back-stack, dialog stack, etc.). isReleased
+    // guard makes the double-call idempotent — if the composable
+    // dispose ran first the player is already gone and this no-ops.
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_DESTROY && !exoPlayer.isReleased) {
+                Timber.d("Releasing exoplayer on Activity ON_DESTROY")
+                exoPlayer.removeListener(playerListener)
+                exoPlayer.release()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     var needsAutoPlay by remember { mutableStateOf(autoplay) }
